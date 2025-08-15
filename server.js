@@ -290,10 +290,17 @@ app.get('/feed.xml', async (req, res) => {
     // than 30 products, you should implement pagination.
     const apiVersion = process.env.API_VERSION || 'v1';
     const productUrl = `https://api.tiendanube.com/${apiVersion}/${store_id}/products`; 
+    // According to Tiendanube's API documentation, requests must include an
+    // `Authentication` header (not `Authorization`) with the format
+    // `bearer ACCESS_TOKEN`. The API will return a 401 Unauthorized or
+    // `Invalid access token` if this header is missing or malformed.
+    // Additionally, we send a `User-Agent` header identifying our app and
+    // an `Accept` header requesting JSON. See docs:【537677115026469†L70-L109】.
     const resp = await fetch(productUrl, {
       headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'User-Agent': 'TN Feed App (contacto@example.com)',
+        Authentication: `bearer ${accessToken}`,
+        'User-Agent': 'TN Feed App (hola@medianaranja.store)',
+        Accept: 'application/json',
       },
     });
     const products = await resp.json();
