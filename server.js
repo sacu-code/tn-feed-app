@@ -4,10 +4,79 @@ const fetch = require('node-fetch');
 // Initialize Express app
 const app = express();
 
-// In‑memory storage for access tokens by store ID. In a production
-// environment you should persist these tokens in a database so
-// they survive restarts and can be shared across instances.
+// Initialize PostgreSQL connection pool. We use the DATABASE_URL
+// environment variable provided by Railway/Vercel to connect to the
+// database. If no DATABASE_URL is present (for example in local
+// development), the pool will not be created and the app will fall
+// back to in‑memory token storage. The table `tokens` must exist
+// with columns id (serial primary key), store_id (text),
+// access_token (text) and created_at (text or timestamp).
+const { Pool } = require('pg');
+let pool;
+if (process.env.DATABASE_URL) {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    // Railway requires SSL but does not provide certificates, so we
+    // disable certificate verification. In a production environment
+    // you should consider more robust SSL configuration.
+    ssl: { rejectUnauthorized: false },
+  });
+}
+
+// In‑memory storage for access tokens by store ID. This will be
+// used when no DATABASE_URL is defined. Tokens stored here will
+// not survive process restarts or scale out to multiple instances.
 const storeTokens = {};
+
+/**
+ * Persist the access token for a store. When a database is available
+ * (pool is defined), this function inserts a new row into the
+ * `tokens` table. Otherwise it falls back to in‑memory storage.
+ *
+ * @param {string} storeId
+ * @param {string} accessToken
+ */
+async function saveToken(storeId, accessToken) {
+  if (pool) {
+    try {
+      await pool.query(
+        'INSERT INTO tokens (store_id, access_token, created_at) VALUES ($1, $2, NOW())',
+        [storeId, accessToken]
+      );
+    } catch (err) {
+      console.error('Error saving token to database:', err);
+    }
+  }
+  // Always update the in‑memory store as well. This ensures
+  // subsequent requests within the same process can use the token
+  // without hitting the database.
+  storeTokens[storeId] = accessToken;
+}
+
+/**
+ * Retrieve the most recent access token for a store. If a database
+ * is available the query will return the latest token; otherwise
+ * the in‑memory store is used.
+ *
+ * @param {string} storeId
+ * @returns {Promise<string|null>}
+ */
+async function getToken(storeId) {
+  if (pool) {
+    try {
+      const result = await pool.query(
+        'SELECT access_token FROM tokens WHERE store_id = $1 ORDER BY id DESC LIMIT 1',
+        [storeId]
+      );
+      if (result.rows.length > 0) {
+        return result.rows[0].access_token;
+      }
+    } catch (err) {
+      console.error('Error retrieving token from database:', err);
+    }
+  }
+  return storeTokens[storeId] || null;
+}
 
 /**
  * Helper to build the Tiendanube installation URL.
@@ -82,8 +151,9 @@ app.get('/oauth/callback', async (req, res) => {
 
     const { access_token, user_id } = data;
 
-    // Store the access token associated with the store ID.
-    storeTokens[user_id] = access_token;
+    // Persist the access token for this store. This will save to
+    // the database if available and update the in‑memory store.
+    await saveToken(user_id.toString(), access_token);
 
     // Build a friendly message with the feed URL for this store.
     const feedUrl = `${process.env.APP_URL}/feed.xml?store_id=${user_id}`;
@@ -167,7 +237,9 @@ app.get('/feed.xml', async (req, res) => {
     return res.status(400).send('Missing store_id');
   }
 
-  const accessToken = storeTokens[store_id];
+  // Retrieve the saved token for this store. If none is found,
+  // the app has not been installed or the token has expired.
+  const accessToken = await getToken(store_id.toString());
   if (!accessToken) {
     return res.status(401).send('Store not authorized. Please install the app first.');
   }
