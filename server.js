@@ -11,16 +11,27 @@ const app = express();
 // back to in‑memory token storage. The table `tokens` must exist
 // with columns id (serial primary key), store_id (text),
 // access_token (text) and created_at (text or timestamp).
-const { Pool } = require('pg');
+// Initialize PostgreSQL connection pool only if a DATABASE_URL is provided
+// and the 'pg' module is available. We defer requiring 'pg' until
+// runtime to avoid crashing the serverless function when the module
+// isn't installed (e.g. on a fresh deploy). If the require fails
+// or no DATABASE_URL is provided, the `pool` remains undefined and
+// the app falls back to in-memory token storage.
 let pool;
 if (process.env.DATABASE_URL) {
-  pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    // Railway requires SSL but does not provide certificates, so we
-    // disable certificate verification. In a production environment
-    // you should consider more robust SSL configuration.
-    ssl: { rejectUnauthorized: false },
-  });
+  try {
+    const { Pool } = require('pg');
+    pool = new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    });
+  } catch (err) {
+    console.warn(
+      'pg module not found or failed to initialize; falling back to in-memory token storage',
+      err
+    );
+    pool = undefined;
+  }
 }
 
 // In‑memory storage for access tokens by store ID. This will be
