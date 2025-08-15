@@ -1,0 +1,15 @@
+{
+  "name": "tn-feed-app",
+  "version": "1.0.0",
+  "description": "External Tiendanube app that generates a product feed XML per store",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "Sacu Digital",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.1"
+  }
+}
