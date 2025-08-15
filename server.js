@@ -1,5 +1,10 @@
 const express = require('express');
-const fetch = require('node-fetch');
+// Use the built-in fetch available in modern Node.js runtimes instead of
+// requiring the node-fetch package. Vercel’s Node environment (v18+) supports
+// the global fetch API natively. If you deploy in an older environment that
+// does not provide fetch, you can polyfill it by installing node-fetch and
+// uncommenting the dynamic import below.
+// const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 // Initialize Express app
 const app = express();
