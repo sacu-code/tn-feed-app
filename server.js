@@ -1,10 +1,23 @@
 const express = require('express');
-// Use the built-in fetch available in modern Node.js runtimes instead of
-// requiring the node-fetch package. Vercel’s Node environment (v18+) supports
-// the global fetch API natively. If you deploy in an older environment that
-// does not provide fetch, you can polyfill it by installing node-fetch and
-// uncommenting the dynamic import below.
-// const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
+// Determine the appropriate `fetch` implementation.  In modern Node.js
+// runtimes (v18+), the global `fetch` API is available.  When running
+// somewhere that does not provide a global fetch (e.g. older Node
+// versions), fall back to dynamically importing the `node-fetch` package.
+// We avoid using `require()` here because `node-fetch` is published as
+// an ES module, and requiring it in a CommonJS context will throw
+// `ERR_REQUIRE_ESM`.  The dynamic import resolves the default export
+// correctly.  See https://github.com/node-fetch/node-fetch for details.
+const fetch = (...args) => {
+  // If a global fetch exists, use it directly.
+  if (typeof globalThis.fetch === 'function') {
+    return globalThis.fetch(...args);
+  }
+  // Otherwise, lazily import node-fetch.  This returns a promise,
+  // so callers must await the returned value just like the native
+  // fetch.  If node-fetch is not installed, this will reject and
+  // errors will be caught by the caller.
+  return import('node-fetch').then(({ default: fetchFn }) => fetchFn(...args));
+};
 
 // Initialize Express app
 const app = express();
@@ -166,6 +179,18 @@ app.get('/oauth/callback', async (req, res) => {
     }
 
     const { access_token, user_id } = data;
+
+    // Ensure the response contains the expected fields.  In some error
+    // conditions Tiendanube returns a 200 status code with an error
+    // object that does not include `user_id` or `access_token`.  When
+    // either field is missing, log the entire response for debugging
+    // and return an error to the client rather than throwing.  This
+    // prevents `TypeError: Cannot read properties of undefined` when
+    // attempting to call `.toString()` on an undefined value.
+    if (!access_token || !user_id) {
+      console.error('Invalid token response:', data);
+      return res.status(500).send('Invalid token response from Tiendanube');
+    }
 
     // Persist the access token for this store. This will save to
     // the database if available and update the in‑memory store.
