@@ -22,34 +22,36 @@ const fetch = (...args) => {
 // Initialize Express app
 const app = express();
 
-// Initialize PostgreSQL connection pool. We use the DATABASE_URL
-// environment variable provided by Railway/Vercel to connect to the
-// database. If no DATABASE_URL is present (for example in local
-// development), the pool will not be created and the app will fall
-// back to in‑memory token storage. The table `tokens` must exist
-// with columns id (serial primary key), store_id (text),
-// access_token (text) and created_at (text or timestamp).
-// Initialize PostgreSQL connection pool only if a DATABASE_URL is provided
-// and the 'pg' module is available. We defer requiring 'pg' until
-// runtime to avoid crashing the serverless function when the module
-// isn't installed (e.g. on a fresh deploy). If the require fails
-// or no DATABASE_URL is provided, the `pool` remains undefined and
-// the app falls back to in-memory token storage.
+// Initialize PostgreSQL connection pool.  We attempt to require the
+// `pg` module at startup so that if it is declared as a dependency it
+// will be available.  If the require fails (for example if `pg`
+// is not installed), the catch block below will log a warning and the
+// application will fall back to in-memory token storage.  When a
+// DATABASE_URL is provided and `pg` is available, a Pool is created
+// immediately.  This approach removes the need for a dynamic require
+// within the request handler and ensures that tokens are persisted
+// whenever possible.  The `tokens` table must exist with the
+// columns id (serial primary key), store_id (text), access_token
+// (text) and created_at (timestamp).
 let pool;
-if (process.env.DATABASE_URL) {
-  try {
-    const { Pool } = require('pg');
+try {
+  // Only create a pool when a connection string is defined.  If
+  // DATABASE_URL is undefined we leave `pool` as undefined and the
+  // application will use the in-memory fallback.  This condition also
+  // means that local development without a database will work.
+  const { Pool } = require('pg');
+  if (process.env.DATABASE_URL) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: { rejectUnauthorized: false },
     });
-  } catch (err) {
-    console.warn(
-      'pg module not found or failed to initialize; falling back to in-memory token storage',
-      err
-    );
-    pool = undefined;
   }
+} catch (err) {
+  console.warn(
+    'The `pg` module could not be loaded; access tokens will not be persisted to the database.',
+    err
+  );
+  pool = undefined;
 }
 
 // In‑memory storage for access tokens by store ID. This will be
