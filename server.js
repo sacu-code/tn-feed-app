@@ -218,33 +218,63 @@ app.get('/oauth/callback', async (req, res) => {
  * item with an `item_group_id`.
  */
 function buildXmlFeed(products, storeDomain) {
+  // Helper to convert values that may be localized objects into strings. If
+  // `value` is an object (for example, `{ es: 'Título', en: 'Title' }`), the
+  // first string or number property is returned. Otherwise the value is
+  // converted to a string. This prevents `[object Object]` from appearing in
+  // the generated XML.
+  function toStringValue(value) {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'string' || typeof value === 'number') {
+      return value.toString();
+    }
+    if (typeof value === 'object') {
+      for (const key in value) {
+        const val = value[key];
+        if (typeof val === 'string' || typeof val === 'number') {
+          return val.toString();
+        }
+      }
+      return JSON.stringify(value);
+    }
+    return String(value);
+  }
+
   const itemsXml = products
     .map((product) => {
       // Use slug as ID. Fallback to product ID if slug missing.
-      const productId = product.handle || product.id;
+      const productId = toStringValue(product.handle) || toStringValue(product.id);
       // Use the first image as the main image link.
-      const imageUrl = product.images && product.images.length > 0 ? product.images[0].src : '';
+      const imageUrl =
+        product.images && product.images.length > 0 ? toStringValue(product.images[0].src) : '';
       // Price: use the first variant price; convert to required format with ARS currency.
       let price = '0.00 ARS';
       if (product.variants && product.variants.length > 0) {
         const p = product.variants[0].price;
-        price = `${p} ARS`;
+        price = `${toStringValue(p)} ARS`;
       }
       // Availability: if product is enabled and at least one variant is in stock.
-      const availableVariant = product.variants.find((v) => v.available);
+      const availableVariant =
+        product.variants && product.variants.find((v) => v.available);
       const availability = availableVariant ? 'in_stock' : 'out_of_stock';
+      // Title and description: handle localized objects.
+      const title = toStringValue(product.name);
+      const description = toStringValue(product.description) || title;
+      // Brand: fallback to 'Media Naranja' if missing.
+      const brand = toStringValue(product.brand) || 'Media Naranja';
+      const handle = toStringValue(product.handle);
       // Build item XML string.
       return (
         `    <item>\n` +
         `      <g:id>${productId}</g:id>\n` +
-        `      <g:title><![CDATA[${product.name}]]></g:title>\n` +
-        `      <g:description><![CDATA[${product.description || product.name}]]></g:description>\n` +
-        `      <g:link>https://${storeDomain}/productos/${product.handle}</g:link>\n` +
+        `      <g:title><![CDATA[${title}]]></g:title>\n` +
+        `      <g:description><![CDATA[${description}]]></g:description>\n` +
+        `      <g:link>https://${storeDomain}/productos/${handle}</g:link>\n` +
         `      <g:image_link>${imageUrl}</g:image_link>\n` +
         `      <g:availability>${availability}</g:availability>\n` +
         `      <g:price>${price}</g:price>\n` +
         `      <g:condition>new</g:condition>\n` +
-        `      <g:brand><![CDATA[${product.brand || 'Media Naranja'}]]></g:brand>\n` +
+        `      <g:brand><![CDATA[${brand}]]></g:brand>\n` +
         `      <g:identifier_exists>false</g:identifier_exists>\n` +
         `    </item>`
       );
