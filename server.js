@@ -1,7 +1,9 @@
 // server.js
 const express = require('express');
 const { Pool } = require('pg');
-// fetch: usa global (Node 18+) o cae a node-fetch si es necesario (ESM)
+const { attachDatabasePool } = require('@vercel/postgres');
+
+// --- fetch (Node 18+ trae global fetch; en otras versiones cae a node-fetch)
 const fetch = (...args) => {
   if (typeof globalThis.fetch === 'function') return globalThis.fetch(...args);
   return import('node-fetch').then(({ default: f }) => f(...args));
@@ -12,18 +14,37 @@ const app = express();
 /* =========================
    PostgreSQL: pool & schema
    ========================= */
+
 let pool;
+
+// Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback)
+function getConnectionString() {
+  return (
+    process.env.DATABASE_URL || // si ya la definiste manualmente
+    process.env.DATABASE_POSTGRES_URL || // creada por integración Neon
+    process.env.DATABASE_URL_UNPOOLED ||
+    process.env.DATABASE_POSTGRES_URL_NON_POOLING ||
+    process.env.DATABASE_DATABASE_URL_UNPOOLED ||
+    null
+  );
+}
+
 (async () => {
   try {
-    if (process.env.DATABASE_URL) {
+    const connectionString = getConnectionString();
+    if (connectionString) {
       pool = new Pool({
-        connectionString: process.env.DATABASE_URL,
+        connectionString,
         ssl: { rejectUnauthorized: false },
       });
+
+      // Evita fugas de conexiones en serverless (necesita @vercel/postgres)
+      attachDatabasePool(pool);
+
       await ensureSchema();
       console.log('[DB] Pool inicializado y schema verificado');
     } else {
-      console.warn('[DB] Sin DATABASE_URL: se usará almacenamiento en memoria');
+      console.warn('[DB] Sin cadena de conexión: se usará almacenamiento en memoria');
     }
   } catch (err) {
     console.warn('[DB] No se pudo inicializar la base de datos', err);
@@ -41,16 +62,18 @@ async function ensureSchema() {
       access_token TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_store_id ON tokens(store_id);
   `);
 }
 
-// Fallback en memoria (mismo proceso)
+// Fallback en memoria (mientras no haya DB)
 const storeTokens = Object.create(null);
 
-/** Guarda/actualiza token de la tienda (DB si hay; si no, memoria) */
+/** Guarda/actualiza token (DB si hay; si no, memoria) */
 async function saveToken(storeId, accessToken) {
-  storeTokens[storeId] = accessToken; // siempre actualiza memoria (cálido inmediato)
+  // siempre lo guardamos en memoria para uso inmediato
+  storeTokens[storeId] = accessToken;
 
   if (!pool) return;
   try {
@@ -89,14 +112,55 @@ async function getToken(storeId) {
 /* =========================
    Helpers Tiendanube
    ========================= */
+
 function getInstallUrl(state) {
   const appId = process.env.TN_CLIENT_ID;
   return `https://www.tiendanube.com/apps/${appId}/authorize?state=${state}`;
 }
 
+// --- API de Tiendanube
+async function tnFetch(storeId, token, path) {
+  const base = `https://api.tiendanube.com/v1/${storeId}`;
+  const url = `${base}${path}`;
+  const ua = process.env.TN_USER_AGENT || 'tn-feed-app (no-email@domain)';
+
+  const res = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': ua,
+      'Authentication': `bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
+  }
+  return res.json();
+}
+
+async function fetchAllProducts(storeId, token) {
+  // Trae productos en páginas de 200
+  let page = 1;
+  const per_page = 200;
+  const all = [];
+  while (true) {
+    const data = await tnFetch(
+      storeId,
+      token,
+      `/products?page=${page}&per_page=${per_page}`
+    );
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
+    if (data.length < per_page) break;
+    page += 1;
+  }
+  return all;
+}
+
 /* =========================
    Rutas: instalación & OAuth
    ========================= */
+
 app.get('/install', (req, res) => {
   const state = Math.random().toString(36).slice(2);
   res.redirect(getInstallUrl(state));
@@ -148,104 +212,94 @@ app.get('/oauth/callback', async (req, res) => {
 /* =========================
    Generación del feed XML
    ========================= */
-function buildXmlFeed(products, storeDomain) {
-  const toStringValue = (value) => {
-    if (value === undefined || value === null) return '';
-    if (typeof value === 'string' || typeof value === 'number') return String(value);
-    if (typeof value === 'object') {
-      for (const k in value) {
-        const v = value[k];
-        if (typeof v === 'string' || typeof v === 'number') return String(v);
-      }
-      return JSON.stringify(value);
-    }
-    return String(value);
-  };
 
+function toStringValue(v) {
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'string' || typeof v === 'number') return String(v);
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+function buildXmlFeed(products, storeDomain) {
   const items = products.map((p) => {
-    const productId = toStringValue(p.handle) || toStringValue(p.id);
-    const imageUrl =
-      p.images && p.images.length ? toStringValue(p.images[0].src) : '';
-    let price = '0.00 ARS';
-    if (p.variants && p.variants.length) {
-      price = `${toStringValue(p.variants[0].price)} ARS`;
-    }
-    const available = p.variants && p.variants.find((v) => v.available);
-    const availability = available ? 'in_stock' : 'out_of_stock';
+    const productId = toStringValue(p.handle || p.id);
     const title = toStringValue(p.name);
     const description = toStringValue(p.description) || title;
-    const brand = toStringValue(p.brand) || 'Media Naranja';
-    const handle = toStringValue(p.handle);
+
+    const handle = toStringValue(p.handle || '');
+    const link = `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
+
+    const imageUrl =
+      Array.isArray(p.images) && p.images.length > 0
+        ? toStringValue(p.images[0].src || p.images[0].url || '')
+        : '';
+
+    let price = '0.00 ARS';
+    if (Array.isArray(p.variants) && p.variants.length > 0) {
+      price = `${toStringValue(p.variants[0].price)} ARS`;
+    }
+
+    const availability =
+      Array.isArray(p.variants) && p.variants.find((v) => v.available)
+        ? 'in_stock'
+        : 'out_of_stock';
+
+    const brand =
+      p.brand && (p.brand.name || p.brand)
+        ? toStringValue(p.brand.name || p.brand)
+        : 'Media Naranja';
 
     return [
-      '    <item>',
-      `      <g:id>${productId}</g:id>`,
-      `      <g:title><![CDATA[${title}]]></g:title>`,
-      `      <g:description><![CDATA[${description}]]></g:description>`,
-      `      <g:link>https://${storeDomain}/productos/${handle}</g:link>`,
-      `      <g:image_link>${imageUrl}</g:image_link>`,
-      `      <g:availability>${availability}</g:availability>`,
-      `      <g:price>${price}</g:price>`,
-      `      <g:condition>new</g:condition>`,
-      `      <g:brand><![CDATA[${brand}]]></g:brand>`,
-      `      <g:identifier_exists>false</g:identifier_exists>`,
-      '    </item>',
+      '  <item>',
+      `    <g:id>${productId}</g:id>`,
+      `    <g:title><![CDATA[${title}]]></g:title>`,
+      `    <g:description><![CDATA[${description}]]></g:description>`,
+      `    <g:link>${link}</g:link>`,
+      `    <g:image_link>${imageUrl}</g:image_link>`,
+      `    <g:availability>${availability}</g:availability>`,
+      `    <g:price>${price}</g:price>`,
+      '    <g:condition>new</g:condition>',
+      `    <g:brand><![CDATA[${brand}]]></g:brand>`,
+      '    <g:identifier_exists>false</g:identifier_exists>',
+      '  </item>',
     ].join('\n');
   });
 
-  return [
+  const xml = [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">`,
-    `  <channel>`,
-    `    <title>Feed de Productos Tiendanube</title>`,
-    `    <link>https://${storeDomain}</link>`,
-    `    <description>Feed generado desde la API de Tiendanube</description>`,
+    `<channel>`,
+    `  <title>Feed de Productos Tiendanube</title>`,
+    `  <link>https://${storeDomain}/</link>`,
+    `  <description>Feed generado desde la API de Tiendanube</description>`,
     items.join('\n'),
-    `  </channel>`,
+    `</channel>`,
     `</rss>`,
   ].join('\n');
+
+  return xml;
 }
 
 app.get('/feed.xml', async (req, res) => {
   const { store_id } = req.query;
   if (!store_id) return res.status(400).send('Missing store_id');
 
-  const accessToken = await getToken(String(store_id));
-  if (!accessToken) {
-    return res.status(401).send('Store not authorized. Please install the app first.');
-  }
-
   try {
-    const apiVersion = process.env.API_VERSION || 'v1';
-    const url = `https://api.tiendanube.com/${apiVersion}/${store_id}/products`;
-
-    const resp = await fetch(url, {
-      headers: {
-        Authentication: `bearer ${accessToken}`, // Tiendanube usa "Authentication"
-        'User-Agent': 'TN Feed App (sacudigital@gmail.com)',
-        Accept: 'application/json',
-      },
-    });
-
-    const products = await resp.json();
-    if (!Array.isArray(products)) {
-      console.error('[Feed] Respuesta inesperada de productos:', products);
-      return res.status(500).send('Error fetching products');
+    const token = await getToken(store_id);
+    if (!token) {
+      return res
+        .status(401)
+        .send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    let storeDomain = '';
-    if (products.length && products[0].permalink) {
-      try {
-        storeDomain = new URL(products[0].permalink).hostname;
-      } catch {
-        storeDomain = `${store_id}.tiendanube.com`;
-      }
-    } else {
-      storeDomain = `${store_id}.tiendanube.com`;
-    }
+    // Dominio canónico de la tienda (si no lo tienes guardado, usa {store_id}.tiendanube.com)
+    const storeDomain = `${store_id}.tiendanube.com`;
+
+    // Traer productos de la API
+    const products = await fetchAllProducts(store_id, token);
 
     const xml = buildXmlFeed(products, storeDomain);
-    res.set('Content-Type', 'application/xml');
+    res.setHeader('Content-Type', 'text/xml; charset=utf-8');
     res.send(xml);
   } catch (err) {
     console.error('[Feed] Error generando feed:', err);
@@ -254,8 +308,9 @@ app.get('/feed.xml', async (req, res) => {
 });
 
 /* =========================
-   Endpoints de debug (opc.)
+   Debug opcional
    ========================= */
+
 if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
     try {
@@ -289,5 +344,4 @@ const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
-
 module.exports = app;
