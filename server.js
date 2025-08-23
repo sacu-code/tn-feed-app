@@ -1,6 +1,6 @@
 // server.js
-cconst express = require('express');
-const{ Pool } = require('pg');
+const express = require('express');
+cconst { Pool } = require('pg');
 // fetch: usa global (Node 18+) o cae a node-fetch si es necesario (ESM)
 const fetch = (...args) => {
   if (typeof globalThis.fetch === 'function') return globalThis.fetch(...args);
