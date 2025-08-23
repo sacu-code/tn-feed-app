@@ -1,6 +1,6 @@
 // server.js
-const express = require('express');
-
+cconst express = require('express');
+const{ Pool } = require('pg');
 // fetch: usa global (Node 18+) o cae a node-fetch si es necesario (ESM)
 const fetch = (...args) => {
   if (typeof globalThis.fetch === 'function') return globalThis.fetch(...args);
@@ -15,7 +15,6 @@ const app = express();
 let pool;
 (async () => {
   try {
-    const { Pool } = require('pg');
     if (process.env.DATABASE_URL) {
       pool = new Pool({
         connectionString: process.env.DATABASE_URL,
@@ -27,7 +26,7 @@ let pool;
       console.warn('[DB] Sin DATABASE_URL: se usará almacenamiento en memoria');
     }
   } catch (err) {
-    console.warn('[DB] No se pudo cargar "pg"; se usará almacenamiento en memoria', err);
+    console.warn('[DB] No se pudo inicializar la base de datos', err);
     pool = undefined;
   }
 })();
