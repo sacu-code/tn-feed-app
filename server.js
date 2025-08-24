@@ -1,7 +1,6 @@
 // server.js
 const express = require('express');
 const { Pool } = require('pg');
-const { attachDatabasePool } = require('@vercel/postgres');
 
 // --- fetch (Node 18+ trae global fetch; en otras versiones cae a node-fetch)
 const fetch = (...args) => {
@@ -38,8 +37,7 @@ function getConnectionString() {
         ssl: { rejectUnauthorized: false },
       });
 
-      // Evita fugas de conexiones en serverless (necesita @vercel/postgres)
-      attachDatabasePool(pool);
+      // Ya no usamos attachDatabasePool; el pool funciona bien sin él
 
       await ensureSchema();
       console.log('[DB] Pool inicializado y schema verificado');
@@ -326,7 +324,10 @@ if (process.env.DEBUG === 'true') {
 
   app.get('/debug/tokens', async (_req, res) => {
     try {
-      if (!pool) return res.json({ rows: Object.keys(storeTokens).map(s => ({ store_id: s })) });
+      if (!pool)
+        return res.json({
+          rows: Object.keys(storeTokens).map((s) => ({ store_id: s })),
+        });
       const { rows } = await pool.query(
         'SELECT store_id, created_at FROM tokens ORDER BY created_at DESC LIMIT 50'
       );
