@@ -110,6 +110,49 @@ async function getToken(storeId) {
 }
 
 /* =========================
+   Landing (raíz)
+   ========================= */
+
+// Landing para Tiendanube (sirve para el modo "Aplicación de Prueba")
+app.get('/', (_req, res) => {
+  const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
+  res.type('html').send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Feed XML — SACU Digital</title>
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 2rem; color: #222; }
+    .wrap { max-width: 820px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+    p { line-height: 1.5; }
+    .cta { margin-top: 1rem; display: inline-block; background: #1976d2; color: #fff; text-decoration: none; padding: .6rem 1rem; border-radius: .4rem; }
+    .links a { margin-right: 1rem; }
+    code { background: #f6f8fa; padding: .15rem .35rem; border-radius: .25rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Feed XML para Tiendanube</h1>
+    <p>Generá un feed compatible con Google Merchant para tu tienda. Instalá la app y obtené tu enlace de <code>/feed.xml?store_id=…</code>.</p>
+
+    <a class="cta" href="/install">Instalar en mi tienda</a>
+
+    <div class="links" style="margin-top:1rem">
+      <a href="/health/db" target="_blank">Health DB</a>
+      <a href="/debug/tokens" target="_blank">Tokens</a>
+    </div>
+
+    <p style="margin-top:1.5rem; color:#555">
+      URL de producción: <code>${appUrl}</code>
+    </p>
+  </div>
+</body>
+</html>`);
+});
+
+/* =========================
    Helpers Tiendanube
    ========================= */
 
