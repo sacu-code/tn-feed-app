@@ -18,6 +18,10 @@ let pool;
 
 // Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback)
 function getConnectionString() {
+  // En producción usa solo DATABASE_URL
+  if (process.env.NODE_ENV === 'production') {
+    return process.env.DATABASE_URL || null;
+  }
   return (
     process.env.DATABASE_URL || // si ya la definiste manualmente
     process.env.DATABASE_POSTGRES_URL || // creada por integración Neon
