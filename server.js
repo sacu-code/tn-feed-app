@@ -16,33 +16,33 @@ const app = express();
 
 let pool;
 
-// Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback)
+/** Devuelve la mejor cadena de conexión disponible (fallbacks) */
 function getConnectionString() {
-  // En producción usa solo DATABASE_URL
-  if (process.env.NODE_ENV === 'production') {
-    return process.env.DATABASE_URL || null;
-  }
   return (
-    process.env.DATABASE_URL || // si ya la definiste manualmente
-    process.env.DATABASE_POSTGRES_URL || // creada por integración Neon
-    process.env.DATABASE_URL_UNPOOLED ||
-    process.env.DATABASE_POSTGRES_URL_NON_POOLING ||
-    process.env.DATABASE_DATABASE_URL_UNPOOLED ||
+    process.env.DATABASE_URL ||                        // Neon pooler (recomendada)
+    process.env.DATABASE_POSTGRES_URL ||               // integraciones
+    process.env.DATABASE_URL_UNPOOLED ||               // sin pool
+    process.env.DATABASE_POSTGRES_URL_NON_POOLING ||   // otra variante sin pool
+    process.env.DATABASE_DATABASE_URL_UNPOOLED ||      // otra variante sin pool
     null
   );
+}
+
+// enmascara strings sensibles en logs
+function mask(s, keep = 8) {
+  if (!s || typeof s !== 'string') return s;
+  return s.slice(0, keep) + '***';
 }
 
 (async () => {
   try {
     const connectionString = getConnectionString();
     if (connectionString) {
+      console.log('[DB] Using connection string:', mask(connectionString));
       pool = new Pool({
         connectionString,
-        ssl: { rejectUnauthorized: false },
+        ssl: { rejectUnauthorized: false }, // necesario con Neon/pg en serverless
       });
-
-      // Ya no usamos attachDatabasePool; el pool funciona bien sin él
-
       await ensureSchema();
       console.log('[DB] Pool inicializado y schema verificado');
     } else {
@@ -64,7 +64,6 @@ async function ensureSchema() {
       access_token TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
-
     CREATE UNIQUE INDEX IF NOT EXISTS idx_tokens_store_id ON tokens(store_id);
   `);
 }
@@ -74,24 +73,20 @@ const storeTokens = Object.create(null);
 
 /** Guarda/actualiza token (DB si hay; si no, memoria) */
 async function saveToken(storeId, accessToken) {
-  // siempre lo guardamos en memoria para uso inmediato
   storeTokens[storeId] = accessToken;
-
   if (!pool) return;
   try {
     await pool.query(
-      `
-      INSERT INTO tokens (store_id, access_token, created_at)
-      VALUES ($1, $2, NOW())
-      ON CONFLICT (store_id)
-      DO UPDATE SET access_token = EXCLUDED.access_token,
-                    created_at   = NOW()
-      `,
+      `INSERT INTO tokens (store_id, access_token, created_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (store_id)
+       DO UPDATE SET access_token = EXCLUDED.access_token,
+                     created_at   = NOW()`,
       [storeId, accessToken]
     );
-    console.log(`[DB] Token guardado para store_id=${storeId}`);
+    console.log('[DB] Token guardado para store_id=' + storeId);
   } catch (err) {
-    console.error('[DB] ERROR guardando token:', err);
+    console.error('[DB] ERROR guardando token para', storeId, err);
   }
 }
 
@@ -110,6 +105,52 @@ async function getToken(storeId) {
   }
   return storeTokens[storeId] || null;
 }
+
+/* =========================
+   Landing (raíz)
+   ========================= */
+
+app.get('/', (_req, res) => {
+  const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
+  const showDebug = process.env.DEBUG === 'true'; // sólo mostrar links de debug si DEBUG=true
+
+  res.type('html').send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Feed XML — SACU Digital</title>
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 2rem; color: #222; }
+    .wrap { max-width: 820px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; margin: 0 0 .5rem; }
+    p { line-height: 1.5; }
+    .cta { margin-top: 1rem; display: inline-block; background: #1976d2; color: #fff; text-decoration: none; padding: .6rem 1rem; border-radius: .4rem; }
+    .links a { margin-right: 1rem; }
+    code { background: #f6f8fa; padding: .15rem .35rem; border-radius: .25rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Feed XML para Tiendanube</h1>
+    <p>Generá un feed compatible con Google Merchant para tu tienda. Instalá la app y obtené tu enlace de <code>/feed.xml?store_id=…</code>.</p>
+
+    <a class="cta" href="/install">Instalar en mi tienda</a>
+
+    ${showDebug ? `
+      <div class="links" style="margin-top:1rem">
+        <a href="/health/db" target="_blank">Health DB</a>
+        <a href="/debug/tokens?admin_token=${encodeURIComponent(process.env.ADMIN_TOKEN || '')}" target="_blank">Tokens</a>
+      </div>
+    ` : ''}
+
+    <p style="margin-top:1.5rem; color:#555">
+      URL de producción: <code>${appUrl}</code>
+    </p>
+  </div>
+</body>
+</html>`);
+});
 
 /* =========================
    Helpers Tiendanube
@@ -141,16 +182,11 @@ async function tnFetch(storeId, token, path) {
 }
 
 async function fetchAllProducts(storeId, token) {
-  // Trae productos en páginas de 200
   let page = 1;
   const per_page = 200;
   const all = [];
   while (true) {
-    const data = await tnFetch(
-      storeId,
-      token,
-      `/products?page=${page}&per_page=${per_page}`
-    );
+    const data = await tnFetch(storeId, token, `/products?page=${page}&per_page=${per_page}`);
     if (!Array.isArray(data) || data.length === 0) break;
     all.push(...data);
     if (data.length < per_page) break;
@@ -199,11 +235,11 @@ app.get('/oauth/callback', async (req, res) => {
     const storeId = String(user_id);
     await saveToken(storeId, access_token);
 
-    const feedUrl = `${process.env.APP_URL}/feed.xml?store_id=${storeId}`;
-    res.send(
+    const feedUrl = `${process.env.APP_URL || ''}/feed.xml?store_id=${storeId}`;
+    res.type('html').send(
       `<h1>¡App instalada correctamente!</h1>
-       <p>Ahora podés acceder a tu feed en el siguiente enlace:</p>
-       <a href="${feedUrl}">${feedUrl}</a>`
+       <p>Tu enlace del feed:</p>
+       <p><a href="${feedUrl}">${feedUrl}</a></p>`
     );
   } catch (err) {
     console.error('[OAuth] Error callback:', err);
@@ -227,7 +263,6 @@ function buildXmlFeed(products, storeDomain) {
     const productId = toStringValue(p.handle || p.id);
     const title = toStringValue(p.name);
     const description = toStringValue(p.description) || title;
-
     const handle = toStringValue(p.handle || '');
     const link = `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
 
@@ -267,7 +302,7 @@ function buildXmlFeed(products, storeDomain) {
     ].join('\n');
   });
 
-  const xml = [
+  return [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">`,
     `<channel>`,
@@ -278,8 +313,6 @@ function buildXmlFeed(products, storeDomain) {
     `</channel>`,
     `</rss>`,
   ].join('\n');
-
-  return xml;
 }
 
 app.get('/feed.xml', async (req, res) => {
@@ -294,12 +327,8 @@ app.get('/feed.xml', async (req, res) => {
         .send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    // Dominio canónico de la tienda (si no lo tienes guardado, usa {store_id}.tiendanube.com)
     const storeDomain = `${store_id}.tiendanube.com`;
-
-    // Traer productos de la API
     const products = await fetchAllProducts(store_id, token);
-
     const xml = buildXmlFeed(products, storeDomain);
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
     res.send(xml);
@@ -310,8 +339,10 @@ app.get('/feed.xml', async (req, res) => {
 });
 
 /* =========================
-   Debug opcional
+   Debug opcional (protegido)
    ========================= */
+
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 
 if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
@@ -326,12 +357,23 @@ if (process.env.DEBUG === 'true') {
     }
   });
 
-  app.get('/debug/tokens', async (_req, res) => {
+  // /debug/tokens protegido: requiere admin token (header o query)
+  app.get('/debug/tokens', async (req, res) => {
+    const provided =
+      req.get('x-admin-token') ||
+      req.query.admin_token ||
+      '';
+
+    if (!ADMIN_TOKEN || provided !== ADMIN_TOKEN) {
+      return res.status(404).send('Not found');
+    }
+
     try {
-      if (!pool)
+      if (!pool) {
         return res.json({
           rows: Object.keys(storeTokens).map((s) => ({ store_id: s })),
         });
+      }
       const { rows } = await pool.query(
         'SELECT store_id, created_at FROM tokens ORDER BY created_at DESC LIMIT 50'
       );
