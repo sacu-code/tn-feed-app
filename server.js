@@ -16,18 +16,18 @@ const app = express();
 
 let pool;
 
-/**
- * Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback).
- * Mantiene un orden de prioridad para minimizar sorpresas en producción.
- * Si ninguna existe, devuelve null y la app caerá al modo en memoria.
- */
+// Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback)
 function getConnectionString() {
+  // En producción usa solo DATABASE_URL
+  if (process.env.NODE_ENV === 'production') {
+    return process.env.DATABASE_URL || null;
+  }
   return (
-    process.env.DATABASE_URL ||                        // recomendada: Neon pooler con ?sslmode=require
-    process.env.DATABASE_POSTGRES_URL ||               // creada por integraciones
-    process.env.DATABASE_URL_UNPOOLED ||               // sin pool
-    process.env.DATABASE_POSTGRES_URL_NON_POOLING ||   // sin pool (nombres alternativos)
-    process.env.DATABASE_DATABASE_URL_UNPOOLED ||      // sin pool (otra variante)
+    process.env.DATABASE_URL || // si ya la definiste manualmente
+    process.env.DATABASE_POSTGRES_URL || // creada por integración Neon
+    process.env.DATABASE_URL_UNPOOLED ||
+    process.env.DATABASE_POSTGRES_URL_NON_POOLING ||
+    process.env.DATABASE_DATABASE_URL_UNPOOLED ||
     null
   );
 }
@@ -38,8 +38,10 @@ function getConnectionString() {
     if (connectionString) {
       pool = new Pool({
         connectionString,
-        ssl: { rejectUnauthorized: false }, // necesario con Neon/pg en serverless
+        ssl: { rejectUnauthorized: false },
       });
+
+      // Ya no usamos attachDatabasePool; el pool funciona bien sin él
 
       await ensureSchema();
       console.log('[DB] Pool inicializado y schema verificado');
@@ -292,7 +294,7 @@ app.get('/feed.xml', async (req, res) => {
         .send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    // Dominio canónico de la tienda (si no lo tenés guardado, usa {store_id}.tiendanube.com)
+    // Dominio canónico de la tienda (si no lo tienes guardado, usa {store_id}.tiendanube.com)
     const storeDomain = `${store_id}.tiendanube.com`;
 
     // Traer productos de la API
