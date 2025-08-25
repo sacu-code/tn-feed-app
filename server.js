@@ -40,9 +40,6 @@ function getConnectionString() {
         connectionString,
         ssl: { rejectUnauthorized: false },
       });
-
-      // Ya no usamos attachDatabasePool; el pool funciona bien sin él
-
       await ensureSchema();
       console.log('[DB] Pool inicializado y schema verificado');
     } else {
@@ -111,53 +108,124 @@ async function getToken(storeId) {
   return storeTokens[storeId] || null;
 }
 
+/** Chequea si hay token persistido */
+async function hasToken(storeId) {
+  if (!storeId) return false;
+  if (pool) {
+    try {
+      const { rows } = await pool.query(
+        'SELECT 1 FROM tokens WHERE store_id = $1 LIMIT 1',
+        [storeId]
+      );
+      return rows.length > 0;
+    } catch (e) {
+      console.error('[DB] hasToken error:', e);
+    }
+  }
+  return !!storeTokens[storeId];
+}
+
 /* =========================
-   Helpers Tiendanube
+   Landing minimal
    ========================= */
 
-function getInstallUrl(state) {
-  const appId = process.env.TN_CLIENT_ID;
-  return `https://www.tiendanube.com/apps/${appId}/authorize?state=${state}`;
-}
+app.get('/', (_req, res) => {
+  const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
+  res.type('html').send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Feed XML — SACU Digital</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 2rem; color: #222; }
+    .wrap { max-width: 820px; margin: 0 auto; }
+    h1 { font-size: 1.6rem; margin: 0 0 .75rem; }
+    p { line-height: 1.5; color:#444 }
+    .cta { margin-top: 1rem; display: inline-block; background: #1976d2; color: #fff;
+           text-decoration: none; padding: .6rem 1rem; border-radius: .4rem; }
+    .card { margin-top: 1.25rem; padding: 1rem; border: 1px solid #e5e7eb; border-radius: .5rem; background:#fafafa }
+    input[type="text"] { padding:.5rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; width: 280px; }
+    button[type="submit"] { margin-left:.5rem; padding:.5rem .8rem; border:0; background:#374151; color:#fff; border-radius:.4rem; }
+    small code { background: #f6f8fa; padding: .15rem .35rem; border-radius: .25rem; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Feed XML para Tiendanube</h1>
+    <p>Generá un feed compatible con Google Merchant. Instalá la app y luego accedé a tu enlace <small><code>/feed.xml?store_id=…</code></small>.</p>
 
-// --- API de Tiendanube
-async function tnFetch(storeId, token, path) {
-  const base = `https://api.tiendanube.com/v1/${storeId}`;
-  const url = `${base}${path}`;
-  const ua = process.env.TN_USER_AGENT || 'tn-feed-app (no-email@domain)';
+    <a class="cta" href="/install">Instalar en mi tienda</a>
 
-  const res = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': ua,
-      'Authentication': `bearer ${token}`,
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
-  }
-  return res.json();
-}
+    <div class="card">
+      <form action="/dashboard" method="get">
+        <label for="store_id"><strong>Ver mi feed:</strong></label><br/>
+        <input id="store_id" name="store_id" type="text" placeholder="Ingresá tu store_id" required />
+        <button type="submit">Ir al panel</button>
+      </form>
+      <p style="margin:.6rem 0 0;color:#555">
+        URL de producción: <code>${appUrl}</code>
+      </p>
+    </div>
+  </div>
+</body>
+</html>`);
+});
 
-async function fetchAllProducts(storeId, token) {
-  // Trae productos en páginas de 200
-  let page = 1;
-  const per_page = 200;
-  const all = [];
-  while (true) {
-    const data = await tnFetch(
-      storeId,
-      token,
-      `/products?page=${page}&per_page=${per_page}`
-    );
-    if (!Array.isArray(data) || data.length === 0) break;
-    all.push(...data);
-    if (data.length < per_page) break;
-    page += 1;
-  }
-  return all;
-}
+/* =========================
+   Panel por tienda (muestra link listo para copiar)
+   ========================= */
+
+app.get('/dashboard', async (req, res) => {
+  const { store_id } = req.query || {};
+  const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
+  const feedUrl = store_id ? `${appUrl}/feed.xml?store_id=${store_id}` : '';
+  const has = await hasToken(store_id);
+
+  res.type('html').send(`<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Mi Catálogo — Feed XML</title>
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 2rem; color: #222; }
+    .wrap { max-width: 820px; margin: 0 auto; }
+    .badge { font-size:.78rem; padding:.2rem .45rem; border-radius:.4rem; margin-left:.35rem }
+    .ok { background:#e9f7ef; color:#1b5e20; border:1px solid #c8e6c9 }
+    .warn { background:#fff3cd; color:#7c4a03; border:1px solid #ffecb5 }
+    input[type="text"] { width: 100%; padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; }
+    .row { display:flex; gap:.5rem; margin-top:.5rem }
+    .btn { padding:.5rem .8rem; border:0; border-radius:.4rem; background:#1976d2; color:#fff; }
+    .muted { color:#666 }
+    .box { border:1px solid #e5e7eb; border-radius:.5rem; padding:1rem; margin-top:1rem; background:#fafafa }
+    a { color:#1976d2; text-decoration:none }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Conectar a Tiendanube ${has ? '<span class="badge ok">Autenticado</span>' : '<span class="badge warn">Falta instalar</span>'}</h2>
+    <p class="muted">Estado de la conexión con tu tienda.</p>
+
+    <div class="box">
+      <h3>Catálogo ${has ? '<span class="badge ok">Catálogo encontrado</span>' : ''}</h3>
+      ${store_id ? `
+        <label for="url"><small>Copiá tu URL de catálogo:</small></label>
+        <div class="row">
+          <input id="url" type="text" readonly value="${feedUrl}" />
+          <button class="btn" onclick="navigator.clipboard.writeText('${feedUrl}').then(()=>alert('Enlace copiado'))">Copiar</button>
+          <a class="btn" href="${feedUrl}" target="_blank" style="background:#374151">Abrir</a>
+        </div>
+        <p class="muted" style="margin-top:.5rem">Este enlace es el que debés pegar en Google Merchant u otros destinos.</p>
+      ` : `
+        <p>Ingresá desde la <a href="/">landing</a> tu <code>store_id</code> o instalá la app.</p>
+      `}
+    </div>
+  </div>
+</body>
+</html>`);
+});
 
 /* =========================
    Rutas: instalación & OAuth
@@ -199,12 +267,9 @@ app.get('/oauth/callback', async (req, res) => {
     const storeId = String(user_id);
     await saveToken(storeId, access_token);
 
-    const feedUrl = `${process.env.APP_URL}/feed.xml?store_id=${storeId}`;
-    res.send(
-      `<h1>¡App instalada correctamente!</h1>
-       <p>Ahora podés acceder a tu feed en el siguiente enlace:</p>
-       <a href="${feedUrl}">${feedUrl}</a>`
-    );
+    // Redirigimos directo al panel de esa tienda con el link listo
+    const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
+    res.redirect(`/dashboard?store_id=${storeId}`);
   } catch (err) {
     console.error('[OAuth] Error callback:', err);
     res.status(500).send('Error processing OAuth callback');
@@ -227,25 +292,20 @@ function buildXmlFeed(products, storeDomain) {
     const productId = toStringValue(p.handle || p.id);
     const title = toStringValue(p.name);
     const description = toStringValue(p.description) || title;
-
     const handle = toStringValue(p.handle || '');
     const link = `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
-
     const imageUrl =
       Array.isArray(p.images) && p.images.length > 0
         ? toStringValue(p.images[0].src || p.images[0].url || '')
         : '';
-
     let price = '0.00 ARS';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
       price = `${toStringValue(p.variants[0].price)} ARS`;
     }
-
     const availability =
       Array.isArray(p.variants) && p.variants.find((v) => v.available)
         ? 'in_stock'
         : 'out_of_stock';
-
     const brand =
       p.brand && (p.brand.name || p.brand)
         ? toStringValue(p.brand.name || p.brand)
@@ -267,7 +327,7 @@ function buildXmlFeed(products, storeDomain) {
     ].join('\n');
   });
 
-  const xml = [
+  return [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">`,
     `<channel>`,
@@ -278,8 +338,6 @@ function buildXmlFeed(products, storeDomain) {
     `</channel>`,
     `</rss>`,
   ].join('\n');
-
-  return xml;
 }
 
 app.get('/feed.xml', async (req, res) => {
@@ -294,12 +352,8 @@ app.get('/feed.xml', async (req, res) => {
         .send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    // Dominio canónico de la tienda (si no lo tienes guardado, usa {store_id}.tiendanube.com)
     const storeDomain = `${store_id}.tiendanube.com`;
-
-    // Traer productos de la API
     const products = await fetchAllProducts(store_id, token);
-
     const xml = buildXmlFeed(products, storeDomain);
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
     res.send(xml);
@@ -310,7 +364,7 @@ app.get('/feed.xml', async (req, res) => {
 });
 
 /* =========================
-   Debug opcional
+   Debug opcional (sólo si DEBUG=true)
    ========================= */
 
 if (process.env.DEBUG === 'true') {
