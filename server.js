@@ -137,18 +137,30 @@ app.get('/', (_req, res) => {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Feed XML — SACU Digital</title>
+  <title>XML Nube by Sacu Partner Tecnológico Tiendanube</title>
   <style>
-    :root { --brand:${BRAND_PRIMARY}; --accent:${BRAND_ACCENT}; color-scheme: light dark; }
     body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 2rem; color: #222; }
     .wrap { max-width: 880px; margin: 0 auto; }
-    header { display:flex; align-items:center; gap:.75rem; margin-bottom:1rem; }
-    header img { height: 38px; }
-    h1 { font-size: 1.6rem; margin: 0 0 .25rem; }
-    p { line-height: 1.55; color:#444; margin:.25rem 0; }
-    .cta { margin-top: 1rem; display: inline-block; background: var(--brand); color: #fff;
-           text-decoration: none; padding: .65rem 1rem; border-radius: .5rem; }
-    .card { margin-top: 1.25rem; padding: 1rem; border: 1px solid #e5e7eb; border-radius: .5rem; background:#fafafa }
+    h1 { font-size: 1.6rem; margin: 0 0 .5rem; font-weight: 700; }
+    p  { line-height: 1.55; color:#444; margin:.35rem 0; }
+    /* botón naranja */
+    .cta {
+      margin-top: 1.25rem;
+      display: inline-block;
+      background: #ff6f3d;
+      color: #fff;
+      text-decoration: none;
+      padding: .70rem 1.15rem;
+      border-radius: 28px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.12);
+      transition: transform .05s ease, filter .15s ease;
+    }
+    .cta:hover { filter: brightness(1.05); }
+    .cta:active { transform: translateY(1px); }
+    .card {
+      margin-top: 1.25rem; padding: 1rem; border: 1px solid #e5e7eb;
+      border-radius: .5rem; background:#fafafa
+    }
     input[type="text"] { padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; width: 320px; }
     button[type="submit"] { margin-left:.5rem; padding:.55rem .8rem; border:0; background:#374151; color:#fff; border-radius:.4rem; }
     small code { background: #f6f8fa; padding: .15rem .35rem; border-radius: .25rem; }
@@ -156,26 +168,17 @@ app.get('/', (_req, res) => {
 </head>
 <body>
   <div class="wrap">
-    <header>
-      <img src="${LOGO_URL}" alt="SACU Digital" />
-      <div>
-        <h1>Feed XML para Tiendanube</h1>
-        <p>Generá un feed compatible con Google Merchant. Instalá la app y luego accedé a tu enlace <small><code>/feed.xml?store_id=…</code></small>.</p>
-      </div>
-    </header>
-
-    <!-- IMPORTANTE: target _top rompe el iframe de Tiendanube -->
+    <h1>XML Nube by Sacu Partner Tecnológico Tiendanube</h1>
+    <p>Generá un feed compatible con Google Merchant. Instalá la app y luego accedé a tu enlace <small><code>/feed.xml?store_id=…</code></small>.</p>
+    <!-- IMPORTANTE: target _top para romper el iframe de Tiendanube -->
     <a class="cta" href="/admin/apps/19066/authorize/" target="_top">Instalar en mi tienda</a>
-
     <div class="card">
       <form action="/dashboard" method="get">
         <label for="store_id"><strong>Ver mi feed:</strong></label><br/>
         <input id="store_id" name="store_id" type="text" placeholder="Ingresá tu store_id" required />
         <button type="submit">Ir al panel</button>
       </form>
-      <p style="margin:.6rem 0 0;color:#555">
-        URL de producción: <code>${appUrl}</code>
-      </p>
+      <p style="margin:.6rem 0 0;color:#555">URL de producción: <code>${appUrl}</code></p>
     </div>
   </div>
 </body>
