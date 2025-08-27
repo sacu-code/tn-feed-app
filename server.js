@@ -150,6 +150,48 @@ function productLink(storeDomain, handle) {
 }
 
 /* =========================
+   API Tiendanube Helpers
+   ========================= */
+
+// Realiza una petición a la API de Tiendanube para el store indicado.
+// Si la petición no devuelve 200, arroja un error con el contenido de respuesta.
+async function tnFetch(storeId, token, path) {
+  const base = `https://api.tiendanube.com/v1/${storeId}`;
+  const url = `${base}${path}`;
+  const ua = process.env.TN_USER_AGENT || 'tn-feed-app (no-email@domain)';
+  const res = await fetch(url, {
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent': ua,
+      'Authentication': `bearer ${token}`,
+    },
+  });
+  if (!res.ok) {
+    // Intenta recuperar el cuerpo como texto para ayudar al debug
+    const text = await res.text().catch(() => '');
+    throw new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
+  }
+  return res.json();
+}
+
+// Obtiene todos los productos paginando la API de Tiendanube. Devuelve un array
+// con los productos o un array vacío si no hay productos. Si la API retorna
+// menos elementos que el parámetro per_page, asume que se alcanzó el final.
+async function fetchAllProducts(storeId, token) {
+  let page = 1;
+  const per_page = 200;
+  const all = [];
+  while (true) {
+    const data = await tnFetch(storeId, token, `/products?page=${page}&per_page=${per_page}`);
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
+    if (data.length < per_page) break;
+    page += 1;
+  }
+  return all;
+}
+
+/* =========================
    Landing minimal (instalar + ir al panel)
    ========================= */
 app.get('/', (_req, res) => {
