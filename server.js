@@ -187,8 +187,8 @@ app.get('/', (_req, res) => {
 
 /* =========================
    Panel por tienda (React/Nexo dashboard)
-   ========================= */
-app.get('/dashboard', async (req, res) => {
+  /* ========================= */
+app.get('/dashboard-react', async (req, res) => {
   const store_id = req.query.store_id || '';
   // Usa la función hasToken definida arriba para saber si existe token
   const has = await hasToken(store_id);
@@ -217,7 +217,7 @@ app.get('/dashboard', async (req, res) => {
 /* =========================
    Panel por tienda (muestra link listo para copiar) – versión antigua
    ========================= */
-app.get('/dashboard-old', async (req, res) => {
+app.get(/dashboard',
   const { store_id } = req.query || {};
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
   const feedUrl = store_id ? `${appUrl}/feed.xml?store_id=${store_id}` : '';
