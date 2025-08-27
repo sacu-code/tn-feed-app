@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <title>Mi Catálogo — Feed XML</title>
+  <!-- React y ReactDOM -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tiendanube/nexo@latest/dist/nexo.umd.js"></script>
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 1.5rem; color: #222; }
+    .cta { margin-top: 1.25rem; display:inline-block; background: #ff6f3d; color:#fff; text-decoration:none; padding:.70rem 1.15rem; border-radius:28px; box-shadow:0 2px 8px rgba(0,0,0,.12); }
+    .cta:hover { filter: brightness(1.05); }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    // Datos iniciales inyectados desde el backend
+    window.__APP_DATA__ = window.__APP_DATA__ || { storeId: '', hasToken: false };
+    window.__APP_URL__  = window.__APP_URL__  || '';
+
+    (async () => {
+      try { await Nexo.init(); } catch (e) { console.warn('Nexo init error', e); }
+    })();
+  </script>
+  <script type="text/javascript">
+    function Dashboard() {
+      const storeId  = window.__APP_DATA__.storeId;
+      const hasToken = window.__APP_DATA__.hasToken;
+      const feedUrl  = storeId ? `${window.__APP_URL__}/feed.xml?store_id=${storeId}` : '';
+      return React.createElement('div', { className:'wrap' }, [
+        React.createElement('h1', {}, 'Mi Catálogo — Feed XML'),
+        React.createElement('p', {}, [
+          'Conectar a Tiendanube: ',
+          hasToken ? React.createElement('span', { style:{ color:'#1b5e20' } }, 'Autenticado') : React.createElement('span', { style:{ color:'#7c4a03' } }, 'Falta instalar')
+        ]),
+        storeId ? React.createElement('div', { style:{ marginTop:'1rem', padding:'1rem', border:'1px solid #e5e7eb', borderRadius:'.5rem', background:'#fafafa' } }, [
+          React.createElement('p', {}, 'Copiá tu URL de catálogo:'),
+          React.createElement('div', { style:{ display:'flex', gap:'0.5rem', marginTop:'.5rem' } }, [
+            React.createElement('input', { type:'text', value:feedUrl, readOnly:true, style:{ flexGrow:1, padding:'.55rem .6rem', border:'1px solid #d1d5db', borderRadius:'.4rem' } }),
+            React.createElement('button', { onClick: () => { navigator.clipboard.writeText(feedUrl); alert('Enlace copiado'); }, style:{ padding:'.55rem .8rem', borderRadius:'.4rem', background:'#0f6fff', color:'#fff', border:0 } }, 'Copiar'),
+            React.createElement('a', { href:feedUrl, target:'_blank', rel:'noopener noreferrer', style:{ padding:'.55rem .8rem', borderRadius:'.4rem', background:'#0f6fff', color:'#fff', textDecoration:'none' } }, 'Abrir')
+          ]),
+          React.createElement('p', { style:{ marginTop:'.5rem', color:'#666' } }, 'Este enlace es el que debés pegar en Google Merchant u otros destinos.')
+        ]) : React.createElement('p', {}, 'Ingresá desde la landing tu store_id o instalá la app.'),
+        !hasToken && React.createElement('a', { className:'cta', href:'/install' }, 'Instalar en mi tienda')
+      ]);
+    }
+    ReactDOM.render(React.createElement(Dashboard), document.getElementById('root'));
+  </script>
+</body>
+</html>
