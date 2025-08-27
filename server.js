@@ -186,38 +186,9 @@ app.get('/', (_req, res) => {
 });
 
 /* =========================
-   Panel por tienda (React/Nexo dashboard)
-  /* ========================= */
-app.get('/dashboard-react', async (req, res) => {
-  const store_id = req.query.store_id || '';
-  // Usa la función hasToken definida arriba para saber si existe token
-  const has = await hasToken(store_id);
-  // Usa APP_URL si está definida; de lo contrario, usa la URL de Vercel o la predeterminada
-  const appUrl = process.env.APP_URL || process.env.VERCEL_URL || 'https://tn-feed-app.vercel.app';
-  const fs = require('fs').promises;
-  const path = require('path');
-
-  try {
-    // Lee la plantilla del dashboard React/Nexo
-    let html = await fs.readFile(path.join(__dirname, 'public', 'dashboard.html'), 'utf8');
-    // Datos a inyectar en el frontend
-    const data = { store_id, hasToken: has };
-    // Reemplaza los marcadores
-    html = html
-      .replace('{{__APP_DATA__}}', JSON.stringify(data))
-      .replace('{{__APP_URL__}}', appUrl);
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.send(html);
-  } catch (err) {
-    console.error('Error loading dashboard template:', err);
-    return res.status(500).send('Error loading dashboard');
-  }
-});
-
-/* =========================
-   Panel por tienda (muestra link listo para copiar) – versión antigua
+   Panel por tienda (muestra link listo para copiar)
    ========================= */
-app.get(/dashboard',
+app.get('/dashboard', async (req, res) => {
   const { store_id } = req.query || {};
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
   const feedUrl = store_id ? `${appUrl}/feed.xml?store_id=${store_id}` : '';
