@@ -10,21 +10,14 @@
     {
       "source": "/(.*)",
       "headers": [
-        /* 👇 Para permitir iframes del admin de Tiendanube/Nuvemshop */
         { "key": "Content-Security-Policy", "value": "frame-ancestors https://admin.tiendanube.com https://*.tiendanube.com https://*.mitiendanube.com https://admin.nuvemshop.com.br https://*.nuvemshop.com.br;" },
-
-        /* 👇 Chrome ya no respeta ALLOW-FROM y valores no estándar se ignoran (quedan permisivos).
-              Lo dejamos para evitar bloqueos heredados y apoyarnos en CSP anterior. */
         { "key": "X-Frame-Options", "value": "ALLOWALL" },
-
-        /* Seguridad básica */
         { "key": "X-Content-Type-Options", "value": "nosniff" },
         { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
         { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" }
       ]
     },
     {
-      /* 👇 Tipo y caché del feed */
       "source": "/feed.xml",
       "headers": [
         { "key": "Content-Type", "value": "application/xml; charset=utf-8" },
