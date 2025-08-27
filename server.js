@@ -171,7 +171,7 @@ app.get('/', (_req, res) => {
     <h1>XML Nube by Sacu Partner Tecnológico Tiendanube</h1>
     <p>Generá un feed compatible con Google Merchant. Instalá la app y luego accedé a tu enlace <small><code>/feed.xml?store_id=…</code></small>.</p>
     <!-- IMPORTANTE: target _top para romper el iframe de Tiendanube -->
-    <a class="cta" href="/admin/apps/19066/authorize/" target="_top">Instalar en mi tienda</a>
+    <a class="cta" href="https://www.tiendanube.com/apps/19066/authorize" target="_top">Instalar en mi tienda</a>
     <div class="card">
       <form action="/dashboard" method="get">
         <label for="store_id"><strong>Ver mi feed:</strong></label><br/>
