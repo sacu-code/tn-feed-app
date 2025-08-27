@@ -128,10 +128,33 @@ const BRAND_ACCENT  = process.env.BRAND_ACCENT  || '#00b2ff';
 const LOGO_URL      = process.env.LOGO_URL      || 'https://www.sacudigital.com/apps-sacu/feedxml/logo.png';
 
 /* =========================
+   Helpers Tiendanube
+   ========================= */
+
+// Genera la URL de instalación en Tiendanube usando TN_CLIENT_ID.
+// Si se pasa un parámetro state, se agrega al final; de lo contrario se devuelve la URL básica.
+function getInstallUrl(state = '') {
+  const appId = process.env.TN_CLIENT_ID;
+  const baseUrl = `https://www.tiendanube.com/apps/${appId}/authorize`;
+  return state ? `${baseUrl}?state=${state}` : baseUrl;
+}
+
+// Construye la URL de la API OAuth de Tiendanube
+function getTokenExchangeUrl() {
+  return 'https://www.tiendanube.com/apps/authorize/token';
+}
+
+// Función para construir enlaces de productos
+function productLink(storeDomain, handle) {
+  return `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
+}
+
+/* =========================
    Landing minimal (instalar + ir al panel)
    ========================= */
 app.get('/', (_req, res) => {
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
+  const installUrl = getInstallUrl();
   res.type('html').send(`<!doctype html>
 <html lang="es">
 <head>
@@ -171,7 +194,7 @@ app.get('/', (_req, res) => {
     <h1>XML Nube by Sacu Partner Tecnológico Tiendanube</h1>
     <p>Generá un feed compatible con Google Merchant. Instalá la app y luego accedé a tu enlace <small><code>/feed.xml?store_id=…</code></small>.</p>
     <!-- IMPORTANTE: target _top para romper el iframe de Tiendanube -->
-    <a class="cta" href="https://www.tiendanube.com/apps/19066/authorize" target="_top">Instalar en mi tienda</a>
+    <a class="cta" href="${installUrl}" target="_top">Instalar en mi tienda</a>
     <div class="card">
       <form action="/dashboard" method="get">
         <label for="store_id"><strong>Ver mi feed:</strong></label><br/>
@@ -193,6 +216,7 @@ app.get('/dashboard', async (req, res) => {
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
   const feedUrl = store_id ? `${appUrl}/feed.xml?store_id=${store_id}` : '';
   const has = await hasToken(store_id);
+  const installUrl = getInstallUrl();
 
   res.type('html').send(`<!doctype html>
 <html lang="es">
@@ -235,7 +259,7 @@ app.get('/dashboard', async (req, res) => {
       `}
       ${!has ? `
         <p style="margin-top:1rem">
-          <a class="btn" href="/admin/apps/19066/authorize/" target="_top">Instalar en mi tienda</a>
+          <a class="btn" href="${installUrl}" target="_top">Instalar en mi tienda</a>
         </p>` : ''}
     </div>
   </div>
@@ -244,61 +268,19 @@ app.get('/dashboard', async (req, res) => {
 });
 
 /* =========================
-   Helpers Tiendanube
-   ========================= */
-
-function getInstallUrl(state) {
-  const appId = process.env.TN_CLIENT_ID;
-  return `https://www.tiendanube.com/apps/${appId}/authorize?state=${state}`;
-}
-
-// --- API de Tiendanube
-async function tnFetch(storeId, token, path) {
-  const base = `https://api.tiendanube.com/v1/${storeId}`;
-  const url = `${base}${path}`;
-  const ua = process.env.TN_USER_AGENT || 'tn-feed-app (no-email@domain)';
-  const res = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': ua,
-      'Authentication': `bearer ${token}`,
-    },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
-  }
-  return res.json();
-}
-
-async function fetchAllProducts(storeId, token) {
-  let page = 1;
-  const per_page = 200;
-  const all = [];
-  while (true) {
-    const data = await tnFetch(storeId, token, `/products?page=${page}&per_page=${per_page}`);
-    if (!Array.isArray(data) || data.length === 0) break;
-    all.push(...data);
-    if (data.length < per_page) break;
-    page += 1;
-  }
-  return all;
-}
-
-/* =========================
    OAuth callback (igual que tu versión, pero redirige a dashboard)
    ========================= */
 
+// Ruta para iniciar instalación desde fuera del admin. Redirige a la URL de Tiendanube.
 app.get('/install', (req, res) => {
-  // si alguien entra directo desde fuera del admin
-  res.redirect('/admin/apps/19066/authorize/');
+  res.redirect(getInstallUrl());
 });
 
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing authorization code');
   try {
-    const resp = await fetch('https://www.tiendanube.com/apps/authorize/token', {
+    const resp = await fetch(getTokenExchangeUrl(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -328,7 +310,7 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Generación del feed XML (idéntico)
+   Generación del feed XML
    ========================= */
 
 function toStringValue(v) {
@@ -344,7 +326,7 @@ function buildXmlFeed(products, storeDomain) {
     const title = toStringValue(p.name);
     const description = toStringValue(p.description) || title;
     const handle = toStringValue(p.handle || '');
-    const link = `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
+    const link = productLink(storeDomain, handle);
     const imageUrl =
       Array.isArray(p.images) && p.images.length > 0
         ? toStringValue(p.images[0].src || p.images[0].url || '')
