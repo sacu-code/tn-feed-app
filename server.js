@@ -363,28 +363,58 @@ function toStringValue(v) {
 }
 
 function buildXmlFeed(products, storeDomain) {
-  const items = products.map((p) => {
-    const productId = toStringValue(p.handle || p.id);
-    const title = toStringValue(p.name);
-    const description = toStringValue(p.description) || title;
-    const handle = toStringValue(p.handle || '');
-    const link = productLink(storeDomain, handle);
-    const imageUrl =
-      Array.isArray(p.images) && p.images.length > 0
-        ? toStringValue(p.images[0].src || p.images[0].url || '')
-        : '';
-    let price = '0.00 ARS';
-    if (Array.isArray(p.variants) && p.variants.length > 0) {
-      price = `${toStringValue(p.variants[0].price)} ARS`;
+  // Helper to extract localized values. If field is an object with language keys,
+  // pick the Spanish "es" value or fall back to the first available value.
+  function getLocalized(val) {
+    if (val === undefined || val === null) return '';
+    if (typeof val === 'object') {
+      if (val.es) return val.es;
+      const keys = Object.keys(val);
+      return keys.length > 0 ? val[keys[0]] : '';
     }
-    const availability =
-      Array.isArray(p.variants) && p.variants.find((v) => v.available)
-        ? 'in_stock'
-        : 'out_of_stock';
-    const brand =
-      p.brand && (p.brand.name || p.brand)
-        ? toStringValue(p.brand.name || p.brand)
-        : 'Media Naranja';
+    return String(val);
+  }
+
+  const items = products.map((p) => {
+    // Use numeric product ID for g:id (fallback to string)
+    const productId = p.id ? String(p.id) : getLocalized(p.handle);
+    const title = getLocalized(p.name);
+    const description = getLocalized(p.description) || title;
+    // Handle slug for URL: use handle.es or fallback to numeric id
+    const handleSlug = getLocalized(p.handle) || String(p.id);
+    const link = productLink(storeDomain, handleSlug);
+    // Main image URL
+    const imageUrl = Array.isArray(p.images) && p.images.length > 0
+      ? (p.images[0].src || p.images[0].url || '')
+      : '';
+    // Price and currency: pick first variant's price
+    let price = '0.00';
+    if (Array.isArray(p.variants) && p.variants.length > 0) {
+      const variantPrice = p.variants[0].price || p.variants[0].promotional_price;
+      if (variantPrice) price = String(variantPrice);
+    }
+    const currency = 'ARS';
+    // Availability: in_stock if any variant has stock > 0 or stock_management false
+    let availability = 'out_of_stock';
+    if (Array.isArray(p.variants) && p.variants.length > 0) {
+      for (const v of p.variants) {
+        // If stock_management is false, treat as in stock
+        if (!v.stock_management || (v.stock !== undefined && Number(v.stock) > 0)) {
+          availability = 'in_stock';
+          break;
+        }
+      }
+    }
+    // Brand: try p.brand.name or p.brand directly
+    let brandVal = '';
+    if (p.brand) {
+      if (typeof p.brand === 'object' && p.brand.name) {
+        brandVal = getLocalized(p.brand.name);
+      } else {
+        brandVal = getLocalized(p.brand);
+      }
+    }
+    if (!brandVal) brandVal = 'Media Naranja';
     return [
       '  <item>',
       `    <g:id>${productId}</g:id>`,
@@ -393,9 +423,9 @@ function buildXmlFeed(products, storeDomain) {
       `    <g:link>${link}</g:link>`,
       `    <g:image_link>${imageUrl}</g:image_link>`,
       `    <g:availability>${availability}</g:availability>`,
-      `    <g:price>${price}</g:price>`,
+      `    <g:price>${price} ${currency}</g:price>`,
       '    <g:condition>new</g:condition>',
-      `    <g:brand><![CDATA[${brand}]]></g:brand>`,
+      `    <g:brand><![CDATA[${brandVal}]]></g:brand>`,
       '    <g:identifier_exists>false</g:identifier_exists>',
       '  </item>',
     ].join('\n');
