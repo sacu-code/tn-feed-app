@@ -1,6 +1,7 @@
 // server.js
 const express = require('express');
 const { Pool } = require('pg');
+const crypto = require('crypto');
 
 // --- fetch (Node 18+ trae global fetch; en otras versiones cae a node-fetch)
 const fetch = (...args) => {
@@ -118,6 +119,22 @@ async function hasToken(storeId) {
     }
   }
   return !!storeTokens[storeId];
+}
+
+/**
+ * Deletes a token for the given store from both the in-memory cache and the DB.
+ * This should be called when a store uninstalls the app to comply with
+ * Tiendanube's data deletion requirements.
+ */
+async function deleteToken(storeId) {
+  delete storeTokens[storeId];
+  if (!pool) return;
+  try {
+    await pool.query('DELETE FROM tokens WHERE store_id = $1', [storeId]);
+    console.log(`[DB] Token eliminado para store_id=${storeId}`);
+  } catch (err) {
+    console.error('[DB] ERROR eliminando token:', err);
+  }
 }
 
 /* =========================
@@ -347,6 +364,31 @@ app.get('/oauth/callback', async (req, res) => {
     }
     const storeId = String(user_id);
     await saveToken(storeId, access_token);
+
+    // Register webhook for app/uninstalled to be notified when the merchant uninstalls
+    // This uses the Tiendanube Webhook API. If registration fails, it logs an error
+    // but continues normal OAuth flow. We use the same User-Agent header as tnFetch.
+    try {
+      const webhookUrl = `${process.env.APP_URL || 'https://tn-feed-app.vercel.app'}/webhook`;
+      const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contact@example.com)';
+      const whResp = await fetch(`https://api.tiendanube.com/v1/${storeId}/webhooks`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': ua,
+          'Authentication': `bearer ${access_token}`,
+        },
+        body: JSON.stringify({ event: 'app/uninstalled', url: webhookUrl }),
+      });
+      const whData = await whResp.json().catch(() => ({}));
+      if (!whResp.ok) {
+        console.error('[Webhook] Error registrando webhook app/uninstalled:', whData);
+      } else {
+        console.log('[Webhook] Webhook app/uninstalled registrado');
+      }
+    } catch (whErr) {
+      console.error('[Webhook] Error registrando webhook:', whErr);
+    }
     res.redirect(`/dashboard?store_id=${storeId}`);
   } catch (err) {
     console.error('[OAuth] Error callback:', err);
@@ -463,6 +505,36 @@ app.get('/feed.xml', async (req, res) => {
     console.error('[Feed] Error generando feed:', err);
     res.status(500).send('Error generating feed');
   }
+});
+
+/* =========================
+   Webhook endpoint
+   ========================= */
+// Middleware and handler to verify and process webhooks from Tiendanube.
+// We use express.json() here to parse the JSON payload.
+app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
+  // Webhooks include a HMAC signature in the x-linkedstore-hmac-sha256 header.
+  const hmacHeader = req.headers['x-linkedstore-hmac-sha256'] || req.headers['http_x_linkedstore_hmac_sha256'];
+  const data = JSON.stringify(req.body);
+  const expected = crypto
+    .createHmac('sha256', process.env.TN_CLIENT_SECRET || '')
+    .update(data)
+    .digest('hex');
+  // If the signature doesn't match, reject the webhook.
+  if (!hmacHeader || hmacHeader !== expected) {
+    return res.status(401).send('Invalid signature');
+  }
+  const { store_id, event } = req.body || {};
+  // Only handle app/uninstalled for now.
+  if (event === 'app/uninstalled' && store_id) {
+    try {
+      await deleteToken(String(store_id));
+    } catch (err) {
+      console.error('[Webhook] Error deleting token on uninstall:', err);
+    }
+  }
+  // Always respond with 200 OK to stop retries.
+  return res.status(200).send('OK');
 });
 
 /* =========================
