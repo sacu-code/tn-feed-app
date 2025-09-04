@@ -158,7 +158,10 @@ function productLink(storeDomain, handle) {
 async function tnFetch(storeId, token, path) {
   const base = `https://api.tiendanube.com/v1/${storeId}`;
   const url = `${base}${path}`;
-  const ua = process.env.TN_USER_AGENT || 'tn-feed-app (no-email@domain)';
+  // Use a descriptive User-Agent per Tiendanube certification guidelines.
+  // The app name is feed-xml-by-sacu. If the TN_USER_AGENT environment variable is
+  // defined (e.g. 'feed-xml-by-sacu (contact@example.com)'), it will override this default.
+  const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contact@example.com)';
   const res = await fetch(url, {
     headers: {
       'Content-Type': 'application/json',
