@@ -122,9 +122,7 @@ async function hasToken(storeId) {
 }
 
 /**
- * Deletes a token for the given store from both the in-memory cache and the DB.
- * This should be called when a store uninstalls the app to comply with
- * Tiendanube's data deletion requirements.
+ * Elimina el token de una tienda (memoria + DB). Usado en app/uninstalled.
  */
 async function deleteToken(storeId) {
   delete storeTokens[storeId];
@@ -140,7 +138,7 @@ async function deleteToken(storeId) {
 /* =========================
    Config de marca (colores / logo)
    ========================= */
-const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#0f6fff'; // podés setear color de tu web
+const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#0f6fff';
 const BRAND_ACCENT  = process.env.BRAND_ACCENT  || '#00b2ff';
 const LOGO_URL      = process.env.LOGO_URL      || 'https://www.sacudigital.com/apps-sacu/feedxml/logo.png';
 
@@ -149,7 +147,6 @@ const LOGO_URL      = process.env.LOGO_URL      || 'https://www.sacudigital.com/
    ========================= */
 
 // Genera la URL de instalación en Tiendanube usando TN_CLIENT_ID.
-// Si se pasa un parámetro state, se agrega al final; de lo contrario se devuelve la URL básica.
 function getInstallUrl(state = '') {
   const appId = process.env.TN_CLIENT_ID;
   const baseUrl = `https://www.tiendanube.com/apps/${appId}/authorize`;
@@ -166,19 +163,27 @@ function productLink(storeDomain, handle) {
   return `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
 }
 
+// Parseo simple de cookies
+function parseCookies(cookieHeader) {
+  if (!cookieHeader) return {};
+  return cookieHeader.split(';').reduce((acc, part) => {
+    const [name, ...rest] = part.trim().split('=');
+    acc[name] = decodeURIComponent(rest.join('='));
+    return acc;
+  }, {});
+}
+
 /* =========================
-   API Tiendanube Helpers
+   API Tiendanube: fetch helpers
    ========================= */
 
-// Realiza una petición a la API de Tiendanube para el store indicado.
-// Si la petición no devuelve 200, arroja un error con el contenido de respuesta.
+// Petición autenticada a la API de Tiendanube
 async function tnFetch(storeId, token, path) {
+  // Nota: si usás la versión 2025-03, cambiá a /2025-03/{store_id}
   const base = `https://api.tiendanube.com/v1/${storeId}`;
   const url = `${base}${path}`;
-  // Use a descriptive User-Agent per Tiendanube certification guidelines.
-  // The app name is feed-xml-by-sacu. If the TN_USER_AGENT environment variable is
-  // defined (e.g. 'feed-xml-by-sacu (contact@example.com)'), it will override this default.
-  const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contact@example.com)';
+  // User-Agent conforme certificación: nombre + email o URL de contacto
+  const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
   const res = await fetch(url, {
     headers: {
       'Content-Type': 'application/json',
@@ -187,16 +192,13 @@ async function tnFetch(storeId, token, path) {
     },
   });
   if (!res.ok) {
-    // Intenta recuperar el cuerpo como texto para ayudar al debug
     const text = await res.text().catch(() => '');
     throw new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
   }
   return res.json();
 }
 
-// Obtiene todos los productos paginando la API de Tiendanube. Devuelve un array
-// con los productos o un array vacío si no hay productos. Si la API retorna
-// menos elementos que el parámetro per_page, asume que se alcanzó el final.
+// Pagina productos
 async function fetchAllProducts(storeId, token) {
   let page = 1;
   const per_page = 200;
@@ -212,9 +214,16 @@ async function fetchAllProducts(storeId, token) {
 }
 
 /* =========================
-   Landing minimal (instalar + ir al panel)
+   Landing + Auto-redirect si hay cookie/token
    ========================= */
-app.get('/', (_req, res) => {
+app.get('/', async (req, res) => {
+  const cookies = parseCookies(req.headers.cookie);
+  const sid = req.query.store_id || cookies.store_id;
+
+  if (sid && await hasToken(sid)) {
+    return res.redirect(`/dashboard?store_id=${sid}`);
+  }
+
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
   const installUrl = getInstallUrl();
   res.type('html').send(`<!doctype html>
@@ -228,27 +237,12 @@ app.get('/', (_req, res) => {
     .wrap { max-width: 880px; margin: 0 auto; }
     h1 { font-size: 1.6rem; margin: 0 0 .5rem; font-weight: 700; }
     p  { line-height: 1.55; color:#444; margin:.35rem 0; }
-    /* botón naranja */
-    .cta {
-      margin-top: 1.25rem;
-      display: inline-block;
-      background: #ff6f3d;
-      color: #fff;
-      text-decoration: none;
-      padding: .70rem 1.15rem;
-      border-radius: 28px;
-      box-shadow: 0 2px 8px rgba(0,0,0,.12);
-      transition: transform .05s ease, filter .15s ease;
-    }
-    .cta:hover { filter: brightness(1.05); }
-    .cta:active { transform: translateY(1px); }
-    .card {
-      margin-top: 1.25rem; padding: 1rem; border: 1px solid #e5e7eb;
-      border-radius: .5rem; background:#fafafa
-    }
-    input[type="text"] { padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; width: 320px; }
+    .cta { margin-top: 1.25rem; display:inline-block; background:#ff6f3d; color:#fff; text-decoration:none; padding:.70rem 1.15rem; border-radius:28px; box-shadow:0 2px 8px rgba(0,0,0,.12); transition:transform .05s ease, filter .15s ease; }
+    .cta:hover { filter: brightness(1.05); } .cta:active { transform: translateY(1px); }
+    .card { margin-top:1.25rem; padding:1rem; border:1px solid #e5e7eb; border-radius:.5rem; background:#fafafa }
+    input[type="text"] { padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; width:320px; }
     button[type="submit"] { margin-left:.5rem; padding:.55rem .8rem; border:0; background:#374151; color:#fff; border-radius:.4rem; }
-    small code { background: #f6f8fa; padding: .15rem .35rem; border-radius: .25rem; }
+    small code { background:#f6f8fa; padding:.15rem .35rem; border-radius:.25rem; }
   </style>
 </head>
 <body>
@@ -260,7 +254,7 @@ app.get('/', (_req, res) => {
     <div class="card">
       <form action="/dashboard" method="get">
         <label for="store_id"><strong>Ver mi feed:</strong></label><br/>
-        <input id="store_id" name="store_id" type="text" placeholder="Ingresá tu store_id" required />
+        <input id="store_id" name="store_id" type="text" placeholder="Ingresá tu store_id numérico" required />
         <button type="submit">Ir al panel</button>
       </form>
       <p style="margin:.6rem 0 0;color:#555">URL de producción: <code>${appUrl}</code></p>
@@ -271,12 +265,15 @@ app.get('/', (_req, res) => {
 });
 
 /* =========================
-   Panel por tienda (muestra link listo para copiar)
+   Panel por tienda
    ========================= */
 app.get('/dashboard', async (req, res) => {
-  const { store_id } = req.query || {};
+  const cookies = parseCookies(req.headers.cookie);
+  const store_id = req.query.store_id || cookies.store_id;
+  if (!store_id) return res.redirect('/');
+
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
-  const feedUrl = store_id ? `${appUrl}/feed.xml?store_id=${store_id}` : '';
+  const feedUrl = `${appUrl}/feed.xml?store_id=${store_id}`;
   const has = await hasToken(store_id);
   const installUrl = getInstallUrl();
 
@@ -288,12 +285,12 @@ app.get('/dashboard', async (req, res) => {
   <title>Mi Catálogo — Feed XML</title>
   <style>
     :root { --brand:${BRAND_PRIMARY}; --accent:${BRAND_ACCENT}; }
-    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin: 2rem; color: #222; }
-    .wrap { max-width: 880px; margin: 0 auto; }
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin:2rem; color:#222; }
+    .wrap { max-width:880px; margin:0 auto; }
     .badge { font-size:.78rem; padding:.2rem .45rem; border-radius:.4rem; margin-left:.35rem }
     .ok { background:#e9f7ef; color:#1b5e20; border:1px solid #c8e6c9 }
     .warn { background:#fff3cd; color:#7c4a03; border:1px solid #ffecb5 }
-    input[type="text"] { width: 100%; padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; }
+    input[type="text"] { width:100%; padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; }
     .row { display:flex; gap:.5rem; margin-top:.5rem }
     .btn { padding:.55rem .8rem; border:0; border-radius:.4rem; background:var(--brand); color:#fff; }
     .muted { color:#666 }
@@ -308,21 +305,20 @@ app.get('/dashboard', async (req, res) => {
 
     <div class="box">
       <h3>Catálogo ${has ? '<span class="badge ok">Catálogo encontrado</span>' : ''}</h3>
-      ${store_id ? `
+      ${has ? `
         <label for="url"><small>Copiá tu URL de catálogo:</small></label>
         <div class="row">
           <input id="url" type="text" readonly value="${feedUrl}" />
           <button class="btn" onclick="navigator.clipboard.writeText('${feedUrl}').then(()=>alert('Enlace copiado'))">Copiar</button>
           <a class="btn" href="${feedUrl}" target="_blank" style="background:#374151">Abrir</a>
         </div>
-        <p class="muted" style="margin-top:.5rem">Este enlace es el que debés pegar en Google Merchant u otros destinos.</p>
+        <p class="muted" style="margin-top:.5rem">Este enlace es el que pegás en Google Merchant u otros destinos.</p>
       ` : `
         <p>Ingresá desde la <a href="/">landing</a> tu <code>store_id</code> o instalá la app.</p>
-      `}
-      ${!has ? `
         <p style="margin-top:1rem">
           <a class="btn" href="${installUrl}" target="_top">Instalar en mi tienda</a>
-        </p>` : ''}
+        </p>
+      `}
     </div>
   </div>
 </body>
@@ -330,11 +326,10 @@ app.get('/dashboard', async (req, res) => {
 });
 
 /* =========================
-   OAuth callback (igual que tu versión, pero redirige a dashboard)
+   OAuth callback: guarda token, setea cookie y registra webhook
    ========================= */
-
-// Ruta para iniciar instalación desde fuera del admin. Redirige a la URL de Tiendanube.
 app.get('/install', (req, res) => {
+  // si alguien entra directo desde fuera del admin
   res.redirect(getInstallUrl());
 });
 
@@ -365,12 +360,17 @@ app.get('/oauth/callback', async (req, res) => {
     const storeId = String(user_id);
     await saveToken(storeId, access_token);
 
-    // Register webhook for app/uninstalled to be notified when the merchant uninstalls
-    // This uses the Tiendanube Webhook API. If registration fails, it logs an error
-    // but continues normal OAuth flow. We use the same User-Agent header as tnFetch.
+    // Setea cookie store_id válida en iframe: SameSite=None; Secure
+    const maxAge = 60 * 60 * 24 * 30; // 30 días
+    res.setHeader(
+      'Set-Cookie',
+      `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`
+    );
+
+    // Registrar webhook app/uninstalled
     try {
       const webhookUrl = `${process.env.APP_URL || 'https://tn-feed-app.vercel.app'}/webhook`;
-      const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contact@example.com)';
+      const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
       const whResp = await fetch(`https://api.tiendanube.com/v1/${storeId}/webhooks`, {
         method: 'POST',
         headers: {
@@ -384,11 +384,12 @@ app.get('/oauth/callback', async (req, res) => {
       if (!whResp.ok) {
         console.error('[Webhook] Error registrando webhook app/uninstalled:', whData);
       } else {
-        console.log('[Webhook] Webhook app/uninstalled registrado');
+        console.log('[Webhook] app/uninstalled registrado');
       }
     } catch (whErr) {
       console.error('[Webhook] Error registrando webhook:', whErr);
     }
+
     res.redirect(`/dashboard?store_id=${storeId}`);
   } catch (err) {
     console.error('[OAuth] Error callback:', err);
@@ -397,9 +398,8 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Generación del feed XML
+   Feed XML on-demand
    ========================= */
-
 function toStringValue(v) {
   if (v === undefined || v === null) return '';
   if (typeof v === 'string' || typeof v === 'number') return String(v);
@@ -408,8 +408,7 @@ function toStringValue(v) {
 }
 
 function buildXmlFeed(products, storeDomain) {
-  // Helper to extract localized values. If field is an object with language keys,
-  // pick the Spanish "es" value or fall back to the first available value.
+  // Helper para extraer el valor localizado (es -> fallback)
   function getLocalized(val) {
     if (val === undefined || val === null) return '';
     if (typeof val === 'object') {
@@ -421,36 +420,31 @@ function buildXmlFeed(products, storeDomain) {
   }
 
   const items = products.map((p) => {
-    // Use numeric product ID for g:id (fallback to string)
     const productId = p.id ? String(p.id) : getLocalized(p.handle);
     const title = getLocalized(p.name);
     const description = getLocalized(p.description) || title;
-    // Handle slug for URL: use handle.es or fallback to numeric id
     const handleSlug = getLocalized(p.handle) || String(p.id);
     const link = productLink(storeDomain, handleSlug);
-    // Main image URL
-    const imageUrl = Array.isArray(p.images) && p.images.length > 0
-      ? (p.images[0].src || p.images[0].url || '')
-      : '';
-    // Price and currency: pick first variant's price
+    const imageUrl =
+      Array.isArray(p.images) && p.images.length > 0
+        ? (p.images[0].src || p.images[0].url || '')
+        : '';
     let price = '0.00';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
       const variantPrice = p.variants[0].price || p.variants[0].promotional_price;
       if (variantPrice) price = String(variantPrice);
     }
     const currency = 'ARS';
-    // Availability: in_stock if any variant has stock > 0 or stock_management false
+    // in_stock si alguna variante tiene stock>0 o no gestiona stock
     let availability = 'out_of_stock';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
       for (const v of p.variants) {
-        // If stock_management is false, treat as in stock
         if (!v.stock_management || (v.stock !== undefined && Number(v.stock) > 0)) {
           availability = 'in_stock';
           break;
         }
       }
     }
-    // Brand: try p.brand.name or p.brand directly
     let brandVal = '';
     if (p.brand) {
       if (typeof p.brand === 'object' && p.brand.name) {
@@ -460,6 +454,7 @@ function buildXmlFeed(products, storeDomain) {
       }
     }
     if (!brandVal) brandVal = 'Media Naranja';
+
     return [
       '  <item>',
       `    <g:id>${productId}</g:id>`,
@@ -475,6 +470,7 @@ function buildXmlFeed(products, storeDomain) {
       '  </item>',
     ].join('\n');
   });
+
   return [
     `<?xml version="1.0" encoding="UTF-8"?>`,
     `<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">`,
@@ -508,33 +504,32 @@ app.get('/feed.xml', async (req, res) => {
 });
 
 /* =========================
-   Webhook endpoint
+   Webhook endpoint: app/uninstalled
    ========================= */
-// Middleware and handler to verify and process webhooks from Tiendanube.
-// We use express.json() here to parse the JSON payload.
 app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
-  // Webhooks include a HMAC signature in the x-linkedstore-hmac-sha256 header.
-  const hmacHeader = req.headers['x-linkedstore-hmac-sha256'] || req.headers['http_x_linkedstore_hmac_sha256'];
-  const data = JSON.stringify(req.body);
-  const expected = crypto
-    .createHmac('sha256', process.env.TN_CLIENT_SECRET || '')
-    .update(data)
-    .digest('hex');
-  // If the signature doesn't match, reject the webhook.
-  if (!hmacHeader || hmacHeader !== expected) {
-    return res.status(401).send('Invalid signature');
-  }
-  const { store_id, event } = req.body || {};
-  // Only handle app/uninstalled for now.
-  if (event === 'app/uninstalled' && store_id) {
-    try {
-      await deleteToken(String(store_id));
-    } catch (err) {
-      console.error('[Webhook] Error deleting token on uninstall:', err);
+  try {
+    const hmacHeader =
+      req.headers['x-linkedstore-hmac-sha256'] || req.headers['http_x_linkedstore_hmac_sha256'];
+    const raw = JSON.stringify(req.body || {});
+    const secret = process.env.TN_CLIENT_SECRET || '';
+    const digest = crypto.createHmac('sha256', secret).update(raw).digest('hex');
+    const verified = hmacHeader && hmacHeader === digest;
+
+    if (!verified) {
+      console.error('[Webhook] Firma inválida');
+      return res.status(401).send('Invalid signature');
     }
+
+    const { store_id, event } = req.body || {};
+    if (event === 'app/uninstalled' && store_id) {
+      await deleteToken(String(store_id));
+      console.log(`[Webhook] app/uninstalled recibido. store_id=${store_id} -> token eliminado`);
+    }
+    return res.status(200).send('OK');
+  } catch (e) {
+    console.error('[Webhook] Error procesando webhook:', e);
+    return res.status(500).send('Error');
   }
-  // Always respond with 200 OK to stop retries.
-  return res.status(200).send('OK');
 });
 
 /* =========================
@@ -544,7 +539,7 @@ if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
     try {
       if (!pool) return res.json({ ok: false, reason: 'no-pool' });
-      const c = await pool.connect();
+    const c = await pool.connect();
       await c.query('SELECT 1');
       c.release();
       res.json({ ok: true });
