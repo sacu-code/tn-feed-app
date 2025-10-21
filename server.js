@@ -1,4 +1,12 @@
-// server.js
+// server.js — versión original + fix de dominio público en <g:link>
+// Cambios mínimos + tolerante a errores (no se cae en Vercel):
+// 1) Intenta leer dominio público desde /store (requiere scope read_store).
+// 2) Si NO hay ese scope o da 403/401/timeout, hace fallback configurable:
+//    - query ?domain=midominio.com (prioridad)
+//    - ENV DOMAINS_MAP="6467092:vertexretail.com.ar,1234:miweb.com" (opcional)
+//    - si nada, usa ${store_id}.tiendanube.com como último recurso (comportamiento original).
+// Así evitamos 500 por falta de permisos y el feed responde siempre.
+
 const express = require('express');
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -158,7 +166,29 @@ function getTokenExchangeUrl() {
   return 'https://www.tiendanube.com/apps/authorize/token';
 }
 
-// Función para construir enlaces de productos
+// === FIX: elegir dominio público desde /store si se puede, con fallbacks ===
+function pickPublicDomain(store) {
+  const domains = Array.isArray(store?.domains) ? store.domains : [];
+  const custom = domains.find(d => typeof d === 'string' && !/\.tiendanube\.com$/i.test(d));
+  if (custom) return custom.replace(/^https?:\/\//, '');
+  if (domains.length) return String(domains[0]).replace(/^https?:\/\//, '');
+  if (store?.original_domain) return String(store.original_domain).replace(/^https?:\/\//, '');
+  return null; // que el llamador decida el último fallback
+}
+
+// Lee override por query o por ENV map
+function resolveDomainFromOverrides(req, storeId) {
+  const q = (req.query.domain || '').toString().trim();
+  if (q && /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(q) && !/\.tiendanube\.com$/i.test(q)) return q;
+  const mapStr = process.env.DOMAINS_MAP || '';
+  if (mapStr) {
+    const pair = mapStr.split(',').map(s => s.trim()).find(s => s.startsWith(storeId + ':'));
+    if (pair) return pair.split(':')[1];
+  }
+  return null;
+}
+
+// Función para construir enlaces de productos (se mantiene igual)
 function productLink(storeDomain, handle) {
   return `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
 }
@@ -179,10 +209,8 @@ function parseCookies(cookieHeader) {
 
 // Petición autenticada a la API de Tiendanube
 async function tnFetch(storeId, token, path) {
-  // Nota: si usás la versión 2025-03, cambiá a /2025-03/{store_id}
   const base = `https://api.tiendanube.com/v1/${storeId}`;
   const url = `${base}${path}`;
-  // User-Agent conforme certificación: nombre + email o URL de contacto
   const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
   const res = await fetch(url, {
     headers: {
@@ -193,7 +221,9 @@ async function tnFetch(storeId, token, path) {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
-    throw new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
+    const err = new Error(`Tiendanube API ${res.status} ${res.statusText} – ${text}`);
+    err.status = res.status; // para poder distinguir 403/401 en el caller
+    throw err;
   }
   return res.json();
 }
@@ -398,7 +428,7 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Feed XML on-demand
+   Feed XML on-demand (usa dominio público si hay, con fallback y sin 500)
    ========================= */
 function toStringValue(v) {
   if (v === undefined || v === null) return '';
@@ -408,7 +438,6 @@ function toStringValue(v) {
 }
 
 function buildXmlFeed(products, storeDomain) {
-  // Helper para extraer el valor localizado (es -> fallback)
   function getLocalized(val) {
     if (val === undefined || val === null) return '';
     if (typeof val === 'object') {
@@ -435,7 +464,6 @@ function buildXmlFeed(products, storeDomain) {
       if (variantPrice) price = String(variantPrice);
     }
     const currency = 'ARS';
-    // in_stock si alguna variante tiene stock>0 o no gestiona stock
     let availability = 'out_of_stock';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
       for (const v of p.variants) {
@@ -468,7 +496,8 @@ function buildXmlFeed(products, storeDomain) {
       `    <g:brand><![CDATA[${brandVal}]]></g:brand>`,
       '    <g:identifier_exists>false</g:identifier_exists>',
       '  </item>',
-    ].join('\n');
+    ].join('
+');
   });
 
   return [
@@ -478,10 +507,12 @@ function buildXmlFeed(products, storeDomain) {
     `  <title>Feed de Productos Tiendanube</title>`,
     `  <link>https://${storeDomain}/</link>`,
     `  <description>Feed generado desde la API de Tiendanube</description>`,
-    items.join('\n'),
+    items.join('
+'),
     `</channel>`,
     `</rss>`,
-  ].join('\n');
+  ].join('
+');
 }
 
 app.get('/feed.xml', async (req, res) => {
@@ -492,13 +523,39 @@ app.get('/feed.xml', async (req, res) => {
     if (!token) {
       return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
     }
-    const storeDomain = `${store_id}.tiendanube.com`;
+
+    // 1) Overrides rápidos (query/ENV) — NO TIENEN efecto si terminan en .tiendanube.com
+    let storeDomain = resolveDomainFromOverrides(req, String(store_id));
+
+    // 2) Si no hay override, intentamos /store (requiere scope read_store)
+    if (!storeDomain) {
+      try {
+        const store = await tnFetch(store_id, token, '/store');
+        storeDomain = pickPublicDomain(store);
+      } catch (e) {
+        // Si es 403/401, explicamos en header y seguimos con fallback
+        if (e && (e.status === 403 || e.status === 401)) {
+          res.setHeader('X-Feed-Warning', 'Falta scope read_store para dominio público; usando fallback');
+        } else {
+          res.setHeader('X-Feed-Warning', 'No se pudo leer /store; usando fallback');
+        }
+      }
+    }
+
+    // 3) Último recurso: subdominio privado (comportamiento anterior)
+    if (!storeDomain) {
+      storeDomain = `${store_id}.tiendanube.com`;
+    }
+
+    // 4) Generar productos como siempre
     const products = await fetchAllProducts(store_id, token);
     const xml = buildXmlFeed(products, storeDomain);
+
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
     res.send(xml);
   } catch (err) {
     console.error('[Feed] Error generando feed:', err);
+    // Evitar crash genérico; dar pista útil
     res.status(500).send('Error generating feed');
   }
 });
@@ -539,7 +596,7 @@ if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
     try {
       if (!pool) return res.json({ ok: false, reason: 'no-pool' });
-    const c = await pool.connect();
+      const c = await pool.connect();
       await c.query('SELECT 1');
       c.release();
       res.json({ ok: true });
@@ -570,5 +627,3 @@ if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
 module.exports = app;
-
-
