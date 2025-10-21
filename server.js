@@ -1,4 +1,6 @@
-// server.js
+// server.js — versión original + fix de dominio público en <g:link>
+// Cambios mínimos: resolvemos el dominio público desde /store y lo usamos en <g:link> y <link> del canal.
+
 const express = require('express');
 const { Pool } = require('pg');
 const crypto = require('crypto');
@@ -158,7 +160,17 @@ function getTokenExchangeUrl() {
   return 'https://www.tiendanube.com/apps/authorize/token';
 }
 
-// Función para construir enlaces de productos
+// === FIX: elegir dominio público desde /store ===
+function pickPublicDomain(store) {
+  const domains = Array.isArray(store?.domains) ? store.domains : [];
+  const custom = domains.find(d => typeof d === 'string' && !/\.tiendanube\.com$/i.test(d));
+  if (custom) return custom.replace(/^https?:\/\//, '');
+  if (domains.length) return String(domains[0]).replace(/^https?:\/\//, '');
+  if (store?.original_domain) return String(store.original_domain).replace(/^https?:\/\//, '');
+  return `${store?.id || 'store'}.tiendanube.com`;
+}
+
+// Función para construir enlaces de productos (se mantiene igual)
 function productLink(storeDomain, handle) {
   return `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
 }
@@ -398,7 +410,7 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Feed XML on-demand
+   Feed XML on-demand (usa dominio público)
    ========================= */
 function toStringValue(v) {
   if (v === undefined || v === null) return '';
@@ -468,7 +480,8 @@ function buildXmlFeed(products, storeDomain) {
       `    <g:brand><![CDATA[${brandVal}]]></g:brand>`,
       '    <g:identifier_exists>false</g:identifier_exists>',
       '  </item>',
-    ].join('\n');
+    ].join('
+');
   });
 
   return [
@@ -478,10 +491,12 @@ function buildXmlFeed(products, storeDomain) {
     `  <title>Feed de Productos Tiendanube</title>`,
     `  <link>https://${storeDomain}/</link>`,
     `  <description>Feed generado desde la API de Tiendanube</description>`,
-    items.join('\n'),
+    items.join('
+'),
     `</channel>`,
     `</rss>`,
-  ].join('\n');
+  ].join('
+');
 }
 
 app.get('/feed.xml', async (req, res) => {
@@ -492,7 +507,11 @@ app.get('/feed.xml', async (req, res) => {
     if (!token) {
       return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
     }
-    const storeDomain = `${store_id}.tiendanube.com`;
+
+    // 🔧 Antes usábamos `${store_id}.tiendanube.com` (privado). Ahora resolvemos dominio público:
+    const store = await tnFetch(store_id, token, '/store');
+    const storeDomain = pickPublicDomain(store); // p.ej. vertexretail.com.ar
+
     const products = await fetchAllProducts(store_id, token);
     const xml = buildXmlFeed(products, storeDomain);
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
@@ -539,7 +558,7 @@ if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
     try {
       if (!pool) return res.json({ ok: false, reason: 'no-pool' });
-    const c = await pool.connect();
+      const c = await pool.connect();
       await c.query('SELECT 1');
       c.release();
       res.json({ ok: true });
