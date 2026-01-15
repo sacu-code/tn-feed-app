@@ -158,19 +158,71 @@ function getTokenExchangeUrl() {
   return 'https://www.tiendanube.com/apps/authorize/token';
 }
 
-// Función para construir enlaces de productos
-function productLink(storeDomain, handle) {
-  return `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
+// --- NUEVO: normalización robusta (EVITA [object Object])
+function normalizeDomain(val) {
+  if (!val) return null;
+
+  if (typeof val === 'string') {
+    return val.trim().replace(/^https?:\/\//i, '').replace(/\/+$/g, '');
+  }
+  if (typeof val === 'number') return String(val);
+
+  // objeto típico: { domain: "..."} o { url: "https://..."} o { es: "..."} etc.
+  if (typeof val === 'object') {
+    if (val.domain) return normalizeDomain(val.domain);
+    if (val.url) return normalizeDomain(val.url);
+    if (val.name) return normalizeDomain(val.name);
+    if (val.host) return normalizeDomain(val.host);
+    if (val.es) return normalizeDomain(val.es);
+
+    // último recurso: evitar [object Object]
+    const s = String(val);
+    if (s === '[object Object]') return null;
+    return normalizeDomain(s);
+  }
+  return null;
 }
 
-// Parseo simple de cookies
-function parseCookies(cookieHeader) {
-  if (!cookieHeader) return {};
-  return cookieHeader.split(';').reduce((acc, part) => {
-    const [name, ...rest] = part.trim().split('=');
-    acc[name] = decodeURIComponent(rest.join('='));
-    return acc;
-  }, {});
+function isLikelyHost(h) {
+  if (!h) return false;
+  // host simple (sin protocolo)
+  return /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(h);
+}
+
+function pickBestDomain(domains) {
+  const list = (domains || [])
+    .map(normalizeDomain)
+    .filter(Boolean);
+
+  if (!list.length) return null;
+
+  // preferir custom (no *.tiendanube.com)
+  const custom = list.find(d => !/\.tiendanube\.com$/i.test(d));
+  return custom || list[0];
+}
+
+// override por query o por env DOMAINS_MAP="6467092:vertexretail.com.ar,2307236:los-locos.com"
+function resolveDomainOverrides(req, storeId) {
+  const q = normalizeDomain(req.query.domain);
+  if (q && isLikelyHost(q) && !/\.tiendanube\.com$/i.test(q)) return q;
+
+  const mapStr = process.env.DOMAINS_MAP || '';
+  if (mapStr) {
+    const pairs = mapStr.split(',').map(s => s.trim()).filter(Boolean);
+    const hit = pairs.find(p => p.startsWith(String(storeId) + ':'));
+    if (hit) {
+      const val = hit.split(':').slice(1).join(':'); // por si el dominio trae ":" raro
+      const host = normalizeDomain(val);
+      if (host && isLikelyHost(host)) return host;
+    }
+  }
+  return null;
+}
+
+// Función para construir enlaces de productos (blindada)
+function productLink(storeDomain, handle) {
+  const host = normalizeDomain(storeDomain) || 'invalid-domain';
+  return `https://${host}/productos/${handle}/?utm_source=xml`;
 }
 
 /* =========================
@@ -179,6 +231,7 @@ function parseCookies(cookieHeader) {
 
 // Petición autenticada a la API de Tiendanube
 async function tnFetch(storeId, token, path) {
+  // Nota: si usás la versión 2025-03, cambiá a /2025-03/{store_id}
   const base = `https://api.tiendanube.com/v1/${storeId}`;
   const url = `${base}${path}`;
   const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
@@ -214,63 +267,59 @@ async function fetchAllProducts(storeId, token) {
 }
 
 /* =========================
-   Helpers de dominio público (robustos y SIN romper el feed)
+   Dominio público (sin romper por scopes)
+   Orden: query -> DOMAINS_MAP -> /domains -> /store -> fallback
    ========================= */
 
-// normaliza host (sin http(s) ni trailing slash)
-function normHost(h) {
-  return String(h || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
-}
+async function getPublicDomain(req, storeId, token) {
+  // 1) overrides (query / env)
+  const override = resolveDomainOverrides(req, storeId);
+  if (override) return override;
 
-// elige un dominio custom si existe, si no devuelve el primero
-function preferCustom(domains) {
-  const list = (domains || []).map(normHost).filter(Boolean);
-  const custom = list.find(d => !/\.tiendanube\.com$/i.test(d));
-  return custom || list[0] || null;
-}
-
-// override por query o por env DOMAINS_MAP="6467092:vertexretail.com.ar,123:miweb.com"
-function resolveDomainFromOverrides(req, storeId) {
-  const q = (req.query.domain || '').toString().trim();
-  if (q && /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(q) && !/\.tiendanube\.com$/i.test(q)) return q;
-  const mapStr = process.env.DOMAINS_MAP || '';
-  if (mapStr) {
-    const pair = mapStr.split(',').map(s => s.trim()).find(s => s.startsWith(storeId + ':'));
-    if (pair) return pair.split(':')[1];
-  }
-  return null;
-}
-
-// intenta obtener el dominio desde /domains o /store; no lanza, siempre vuelve algo
-async function computePublicDomain(req, storeId, token) {
-  // 1) override rápido
-  let host = resolveDomainFromOverrides(req, String(storeId));
-  if (host) return host;
-
-  const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': ua, 'Authentication': `bearer ${token}` };
-  const base = `https://api.tiendanube.com/v1/${storeId}`;
-
-  // 2) /domains (necesita View Domains)
+  // 2) /domains (si hay permiso)
   try {
-    const res = await fetch(`${base}/domains`, { headers });
-    if (res.ok) {
-      const arr = await res.json();
-      const domains = Array.isArray(arr) ? arr.map(d => d?.domain || d) : [];
-      const pick = preferCustom(domains);
-      if (pick) return pick;
-    }
-  } catch (_) {}
+    const arr = await tnFetch(storeId, token, '/domains');
+    // puede venir como [{domain:"..."}, ...] o strings
+    const domains = Array.isArray(arr) ? arr.map(d => normalizeDomain(d?.domain ?? d)) : [];
+    const pick = pickBestDomain(domains);
+    if (pick) return pick;
+  } catch (e) {
+    // 403/401/404: ignorar y seguir a /store
+  }
 
-  // 3) /store (si hay read_store)
+  // 3) /store (si existe/permiso)
   try {
     const store = await tnFetch(storeId, token, '/store');
-    const pick = preferCustom(store?.domains) || normHost(store?.original_domain);
-    if (pick) return pick;
-  } catch (_) {}
+    // distintas formas posibles
+    const domainsFromStore =
+      Array.isArray(store?.domains) ? store.domains :
+      Array.isArray(store?.domain) ? store.domain :
+      null;
 
-  // 4) fallback original (privado)
+    const pick =
+      pickBestDomain(domainsFromStore) ||
+      normalizeDomain(store?.original_domain) ||
+      normalizeDomain(store?.store_domain);
+
+    if (pick && isLikelyHost(pick)) return pick;
+  } catch (e) {
+    // ignorar
+  }
+
+  // 4) fallback
   return `${storeId}.tiendanube.com`;
+}
+
+/* =========================
+   Parseo simple de cookies
+   ========================= */
+function parseCookies(cookieHeader) {
+  if (!cookieHeader) return {};
+  return cookieHeader.split(';').reduce((acc, part) => {
+    const [name, ...rest] = part.trim().split('=');
+    acc[name] = decodeURIComponent(rest.join('='));
+    return acc;
+  }, {});
 }
 
 /* =========================
@@ -458,14 +507,8 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Feed XML on-demand (con dominio público robusto)
+   Feed XML on-demand (dominio público robusto)
    ========================= */
-function toStringValue(v) {
-  if (v === undefined || v === null) return '';
-  if (typeof v === 'string' || typeof v === 'number') return String(v);
-  if (typeof v === 'object') return JSON.stringify(v);
-  return String(v);
-}
 
 function buildXmlFeed(products, storeDomain) {
   // Helper para extraer el valor localizado (es -> fallback)
@@ -479,22 +522,29 @@ function buildXmlFeed(products, storeDomain) {
     return String(val);
   }
 
+  const safeDomain = normalizeDomain(storeDomain) || 'invalid-domain';
+
   const items = products.map((p) => {
     const productId = p.id ? String(p.id) : getLocalized(p.handle);
     const title = getLocalized(p.name);
     const description = getLocalized(p.description) || title;
     const handleSlug = getLocalized(p.handle) || String(p.id);
-    const link = productLink(storeDomain, handleSlug);
+
+    const link = productLink(safeDomain, handleSlug);
+
     const imageUrl =
       Array.isArray(p.images) && p.images.length > 0
         ? (p.images[0].src || p.images[0].url || '')
         : '';
+
     let price = '0.00';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
       const variantPrice = p.variants[0].price || p.variants[0].promotional_price;
       if (variantPrice) price = String(variantPrice);
     }
+
     const currency = 'ARS';
+
     // in_stock si alguna variante tiene stock>0 o no gestiona stock
     let availability = 'out_of_stock';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
@@ -505,6 +555,7 @@ function buildXmlFeed(products, storeDomain) {
         }
       }
     }
+
     let brandVal = '';
     if (p.brand) {
       if (typeof p.brand === 'object' && p.brand.name) {
@@ -536,7 +587,7 @@ function buildXmlFeed(products, storeDomain) {
     '<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">',
     '<channel>',
     '  <title>Feed de Productos Tiendanube</title>',
-    `  <link>https://${storeDomain}/</link>`,
+    `  <link>https://${safeDomain}/</link>`,
     '  <description>Feed generado desde la API de Tiendanube</description>',
     items.join('\n'),
     '</channel>',
@@ -547,17 +598,19 @@ function buildXmlFeed(products, storeDomain) {
 app.get('/feed.xml', async (req, res) => {
   const { store_id } = req.query;
   if (!store_id) return res.status(400).send('Missing store_id');
+
   try {
     const token = await getToken(store_id);
     if (!token) {
       return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    // NUEVO: calcular dominio público (con overrides, /domains, /store, y fallback)
-    const storeDomain = await computePublicDomain(req, store_id, token);
+    // NUEVO: dominio público robusto
+    const storeDomain = await getPublicDomain(req, store_id, token);
 
     const products = await fetchAllProducts(store_id, token);
     const xml = buildXmlFeed(products, storeDomain);
+
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
     res.send(xml);
   } catch (err) {
@@ -622,6 +675,16 @@ if (process.env.DEBUG === 'true') {
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
+  });
+
+  // útil para debug del dominio
+  app.get('/debug/domain', async (req, res) => {
+    const store_id = req.query.store_id;
+    if (!store_id) return res.status(400).json({ error: 'missing store_id' });
+    const token = await getToken(store_id);
+    if (!token) return res.status(401).json({ error: 'no token' });
+    const domain = await getPublicDomain(req, store_id, token);
+    res.json({ store_id, domain });
   });
 }
 
