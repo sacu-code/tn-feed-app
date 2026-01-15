@@ -158,11 +158,6 @@ function getTokenExchangeUrl() {
   return 'https://www.tiendanube.com/apps/authorize/token';
 }
 
-// Función para construir enlaces de productos
-function productLink(storeDomain, handle) {
-  return `https://${storeDomain}/productos/${handle}/?utm_source=xml`;
-}
-
 // Parseo simple de cookies
 function parseCookies(cookieHeader) {
   if (!cookieHeader) return {};
@@ -214,63 +209,119 @@ async function fetchAllProducts(storeId, token) {
 }
 
 /* =========================
-   Helpers de dominio público (robustos y SIN romper el feed)
+   Helpers de dominio público (robustos)
    ========================= */
 
-// normaliza host (sin http(s) ni trailing slash)
-function normHost(h) {
-  return String(h || '').replace(/^https?:\/\//, '').replace(/\/$/, '');
+// Devuelve string de dominio (host) o null.
+// Soporta: string, {domain}, {name}, {url}, objetos localizados {es:""}, etc.
+function normalizeDomain(input) {
+  if (input === undefined || input === null) return null;
+
+  // string directo
+  if (typeof input === 'string' || typeof input === 'number') {
+    const s = String(input).trim();
+    if (!s) return null;
+    return s.replace(/^https?:\/\//i, '').replace(/\/+$/g, '');
+  }
+
+  // objeto
+  if (typeof input === 'object') {
+    // localizado: {es: "..."} u otro idioma
+    if (input.es && typeof input.es === 'string') return normalizeDomain(input.es);
+    const keys = Object.keys(input);
+    if (keys.length === 1 && typeof input[keys[0]] === 'string') return normalizeDomain(input[keys[0]]);
+
+    if (input.domain) return normalizeDomain(input.domain);
+    if (input.name) return normalizeDomain(input.name);
+    if (input.url) return normalizeDomain(input.url);
+  }
+
+  // fallback final
+  try {
+    const s = String(input).trim();
+    if (!s) return null;
+    return s.replace(/^https?:\/\//i, '').replace(/\/+$/g, '');
+  } catch (_) {
+    return null;
+  }
 }
 
-// elige un dominio custom si existe, si no devuelve el primero
+// Elige un dominio custom si existe, si no devuelve el primero.
 function preferCustom(domains) {
-  const list = (domains || []).map(normHost).filter(Boolean);
+  const list = (domains || [])
+    .map(normalizeDomain)
+    .filter(Boolean);
+
   const custom = list.find(d => !/\.tiendanube\.com$/i.test(d));
   return custom || list[0] || null;
 }
 
 // override por query o por env DOMAINS_MAP="6467092:vertexretail.com.ar,123:miweb.com"
 function resolveDomainFromOverrides(req, storeId) {
-  const q = (req.query.domain || '').toString().trim();
+  const q = normalizeDomain(req.query.domain);
   if (q && /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(q) && !/\.tiendanube\.com$/i.test(q)) return q;
+
   const mapStr = process.env.DOMAINS_MAP || '';
   if (mapStr) {
-    const pair = mapStr.split(',').map(s => s.trim()).find(s => s.startsWith(storeId + ':'));
-    if (pair) return pair.split(':')[1];
+    const pairs = mapStr.split(',').map(s => s.trim()).filter(Boolean);
+    const found = pairs.find(s => s.startsWith(String(storeId) + ':'));
+    if (found) {
+      const maybe = found.split(':').slice(1).join(':');
+      return normalizeDomain(maybe);
+    }
   }
   return null;
 }
 
-// intenta obtener el dominio desde /domains o /store; no lanza, siempre vuelve algo
+// intenta obtener el dominio desde /domains o /store; no lanza, siempre vuelve string
 async function computePublicDomain(req, storeId, token) {
   // 1) override rápido
-  let host = resolveDomainFromOverrides(req, String(storeId));
-  if (host) return host;
+  const override = resolveDomainFromOverrides(req, String(storeId));
+  if (override) return override;
 
   const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
-  const headers = { 'Content-Type': 'application/json', 'User-Agent': ua, 'Authentication': `bearer ${token}` };
+  const headers = {
+    'Content-Type': 'application/json',
+    'User-Agent': ua,
+    'Authentication': `bearer ${token}`,
+  };
   const base = `https://api.tiendanube.com/v1/${storeId}`;
 
-  // 2) /domains (necesita View Domains)
+  // 2) /domains (View Domains)
   try {
     const res = await fetch(`${base}/domains`, { headers });
     if (res.ok) {
-      const arr = await res.json();
-      const domains = Array.isArray(arr) ? arr.map(d => d?.domain || d) : [];
-      const pick = preferCustom(domains);
-      if (pick) return pick;
+      const arr = await res.json().catch(() => null);
+      if (Array.isArray(arr)) {
+        // arr puede venir como [{domain: "..."}, {domain:{es:"..."}}, ...] o strings
+        const domains = arr.map(d => {
+          if (d && typeof d === 'object' && 'domain' in d) return normalizeDomain(d.domain);
+          return normalizeDomain(d);
+        });
+        const pick = preferCustom(domains);
+        if (pick) return pick;
+      }
     }
   } catch (_) {}
 
   // 3) /store (si hay read_store)
   try {
     const store = await tnFetch(storeId, token, '/store');
-    const pick = preferCustom(store?.domains) || normHost(store?.original_domain);
+    const pick =
+      preferCustom(store?.domains) ||
+      normalizeDomain(store?.original_domain);
     if (pick) return pick;
   } catch (_) {}
 
   // 4) fallback original (privado)
   return `${storeId}.tiendanube.com`;
+}
+
+// Función para construir enlaces de productos (blindada)
+function productLink(storeDomain, handle) {
+  const host = normalizeDomain(storeDomain) || 'invalid-domain';
+  const slug = String(handle || '').trim() || '';
+  return `https://${host}/productos/${slug}/?utm_source=xml`;
 }
 
 /* =========================
@@ -388,14 +439,14 @@ app.get('/dashboard', async (req, res) => {
 /* =========================
    OAuth callback: guarda token, setea cookie y registra webhook
    ========================= */
-app.get('/install', (req, res) => {
-  // si alguien entra directo desde fuera del admin
+app.get('/install', (_req, res) => {
   res.redirect(getInstallUrl());
 });
 
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('Missing authorization code');
+
   try {
     const resp = await fetch(getTokenExchangeUrl(), {
       method: 'POST',
@@ -407,16 +458,19 @@ app.get('/oauth/callback', async (req, res) => {
         code,
       }),
     });
-    const data = await resp.json();
+
+    const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       console.error('[OAuth] Error intercambiando code:', data);
       return res.status(500).send('Failed to obtain access token');
     }
+
     const { access_token, user_id } = data;
     if (!access_token || !user_id) {
       console.error('[OAuth] Respuesta inválida:', data);
       return res.status(500).send('Invalid token response from Tiendanube');
     }
+
     const storeId = String(user_id);
     await saveToken(storeId, access_token);
 
@@ -460,13 +514,6 @@ app.get('/oauth/callback', async (req, res) => {
 /* =========================
    Feed XML on-demand (con dominio público robusto)
    ========================= */
-function toStringValue(v) {
-  if (v === undefined || v === null) return '';
-  if (typeof v === 'string' || typeof v === 'number') return String(v);
-  if (typeof v === 'object') return JSON.stringify(v);
-  return String(v);
-}
-
 function buildXmlFeed(products, storeDomain) {
   // Helper para extraer el valor localizado (es -> fallback)
   function getLocalized(val) {
@@ -479,22 +526,29 @@ function buildXmlFeed(products, storeDomain) {
     return String(val);
   }
 
+  const safeDomain = normalizeDomain(storeDomain) || 'invalid-domain';
+
   const items = products.map((p) => {
     const productId = p.id ? String(p.id) : getLocalized(p.handle);
     const title = getLocalized(p.name);
     const description = getLocalized(p.description) || title;
     const handleSlug = getLocalized(p.handle) || String(p.id);
-    const link = productLink(storeDomain, handleSlug);
+
+    const link = productLink(safeDomain, handleSlug);
+
     const imageUrl =
       Array.isArray(p.images) && p.images.length > 0
         ? (p.images[0].src || p.images[0].url || '')
         : '';
+
     let price = '0.00';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
       const variantPrice = p.variants[0].price || p.variants[0].promotional_price;
       if (variantPrice) price = String(variantPrice);
     }
+
     const currency = 'ARS';
+
     // in_stock si alguna variante tiene stock>0 o no gestiona stock
     let availability = 'out_of_stock';
     if (Array.isArray(p.variants) && p.variants.length > 0) {
@@ -505,6 +559,7 @@ function buildXmlFeed(products, storeDomain) {
         }
       }
     }
+
     let brandVal = '';
     if (p.brand) {
       if (typeof p.brand === 'object' && p.brand.name) {
@@ -536,7 +591,7 @@ function buildXmlFeed(products, storeDomain) {
     '<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">',
     '<channel>',
     '  <title>Feed de Productos Tiendanube</title>',
-    `  <link>https://${storeDomain}/</link>`,
+    `  <link>https://${safeDomain}/</link>`,
     '  <description>Feed generado desde la API de Tiendanube</description>',
     items.join('\n'),
     '</channel>',
@@ -547,17 +602,18 @@ function buildXmlFeed(products, storeDomain) {
 app.get('/feed.xml', async (req, res) => {
   const { store_id } = req.query;
   if (!store_id) return res.status(400).send('Missing store_id');
+
   try {
     const token = await getToken(store_id);
     if (!token) {
       return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    // NUEVO: calcular dominio público (con overrides, /domains, /store, y fallback)
     const storeDomain = await computePublicDomain(req, store_id, token);
 
     const products = await fetchAllProducts(store_id, token);
     const xml = buildXmlFeed(products, storeDomain);
+
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
     res.send(xml);
   } catch (err) {
