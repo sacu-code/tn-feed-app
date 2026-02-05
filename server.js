@@ -16,17 +16,41 @@ const app = express();
    ========================= */
 
 let pool;
-let dbInitPromise;
 
-// Devuelve la cadena de conexión (EN VERCEL/PROD: SIEMPRE pooled)
+// Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback)
 function getConnectionString() {
+  // En producción usa solo DATABASE_URL
+  if (process.env.NODE_ENV === 'production') {
+    return process.env.DATABASE_URL || null;
+  }
   return (
     process.env.DATABASE_URL ||
     process.env.DATABASE_POSTGRES_URL ||
-    process.env.POSTGRES_URL ||
+    process.env.DATABASE_URL_UNPOOLED ||
+    process.env.DATABASE_POSTGRES_URL_NON_POOLING ||
+    process.env.DATABASE_DATABASE_URL_UNPOOLED ||
     null
   );
 }
+
+(async () => {
+  try {
+    const connectionString = getConnectionString();
+    if (connectionString) {
+      pool = new Pool({
+        connectionString,
+        ssl: { rejectUnauthorized: false },
+      });
+      await ensureSchema();
+      console.log('[DB] Pool inicializado y schema verificado');
+    } else {
+      console.warn('[DB] Sin cadena de conexión: se usará almacenamiento en memoria');
+    }
+  } catch (err) {
+    console.warn('[DB] No se pudo inicializar la base de datos', err);
+    pool = undefined;
+  }
+})();
 
 /** Crea tabla tokens si no existe */
 async function ensureSchema() {
@@ -42,56 +66,13 @@ async function ensureSchema() {
   `);
 }
 
-/**
- * Inicializa DB UNA SOLA VEZ.
- * - Evita condición de carrera (requests antes de que el pool esté listo)
- * - Evita usar URLs "unpooled/non_pooling" en prod (causan TLS issues en Vercel)
- */
-async function initDbOnce() {
-  if (dbInitPromise) return dbInitPromise;
-
-  dbInitPromise = (async () => {
-    const connectionString = getConnectionString();
-
-    if (!connectionString) {
-      console.warn('[DB] Sin cadena de conexión: se usará almacenamiento en memoria');
-      pool = undefined;
-      return;
-    }
-
-    pool = new Pool({
-      connectionString,
-      ssl: { rejectUnauthorized: false },
-      max: 5,
-      idleTimeoutMillis: 10_000,
-      connectionTimeoutMillis: 10_000,
-      keepAlive: true,
-    });
-
-    await ensureSchema();
-    console.log('[DB] Pool inicializado y schema verificado');
-  })().catch((err) => {
-    console.warn(
-      '[DB] No se pudo inicializar la base de datos. Se usará memoria. Error:',
-      err
-    );
-    pool = undefined;
-  });
-
-  return dbInitPromise;
-}
-
-// Fallback en memoria (mientras no haya DB o si falla)
+// Fallback en memoria (mientras no haya DB)
 const storeTokens = Object.create(null);
 
 /** Guarda/actualiza token (DB si hay; si no, memoria) */
 async function saveToken(storeId, accessToken) {
-  // Siempre guardo en memoria como fallback
   storeTokens[storeId] = accessToken;
-
-  await initDbOnce();
   if (!pool) return;
-
   try {
     await pool.query(
       `INSERT INTO tokens (store_id, access_token, created_at)
@@ -109,7 +90,6 @@ async function saveToken(storeId, accessToken) {
 
 /** Obtiene token por store_id (prefiere DB; si falla, memoria) */
 async function getToken(storeId) {
-  await initDbOnce();
   if (pool) {
     try {
       const { rows } = await pool.query(
@@ -127,8 +107,6 @@ async function getToken(storeId) {
 /** Chequea si hay token persistido */
 async function hasToken(storeId) {
   if (!storeId) return false;
-
-  await initDbOnce();
   if (pool) {
     try {
       const { rows } = await pool.query(
@@ -148,10 +126,7 @@ async function hasToken(storeId) {
  */
 async function deleteToken(storeId) {
   delete storeTokens[storeId];
-
-  await initDbOnce();
   if (!pool) return;
-
   try {
     await pool.query('DELETE FROM tokens WHERE store_id = $1', [storeId]);
     console.log(`[DB] Token eliminado para store_id=${storeId}`);
@@ -216,6 +191,7 @@ function isLikelyHost(h) {
 
 function pickBestDomain(domains) {
   const list = (domains || []).map(normalizeDomain).filter(Boolean);
+
   if (!list.length) return null;
 
   // preferir custom (no *.tiendanube.com)
@@ -230,13 +206,10 @@ function resolveDomainOverrides(req, storeId) {
 
   const mapStr = process.env.DOMAINS_MAP || '';
   if (mapStr) {
-    const pairs = mapStr
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const pairs = mapStr.split(',').map((s) => s.trim()).filter(Boolean);
     const hit = pairs.find((p) => p.startsWith(String(storeId) + ':'));
     if (hit) {
-      const val = hit.split(':').slice(1).join(':'); // por si el dominio trae ":" raro
+      const val = hit.split(':').slice(1).join(':');
       const host = normalizeDomain(val);
       if (host && isLikelyHost(host)) return host;
     }
@@ -250,17 +223,25 @@ function productLink(storeDomain, handle) {
   return `https://${host}/productos/${handle}/?utm_source=xml`;
 }
 
+// Parseo simple de cookies
+function parseCookies(cookieHeader) {
+  if (!cookieHeader) return {};
+  return cookieHeader.split(';').reduce((acc, part) => {
+    const [name, ...rest] = part.trim().split('=');
+    acc[name] = decodeURIComponent(rest.join('='));
+    return acc;
+  }, {});
+}
+
 /* =========================
    API Tiendanube: fetch helpers
    ========================= */
 
 // Petición autenticada a la API de Tiendanube
 async function tnFetch(storeId, token, path) {
-  // Nota: si usás la versión 2025-03, cambiá a /2025-03/{store_id}
   const base = `https://api.tiendanube.com/v1/${storeId}`;
   const url = `${base}${path}`;
   const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
-
   const res = await fetch(url, {
     headers: {
       'Content-Type': 'application/json',
@@ -275,7 +256,6 @@ async function tnFetch(storeId, token, path) {
     err.status = res.status;
     throw err;
   }
-
   return res.json();
 }
 
@@ -284,7 +264,6 @@ async function fetchAllProducts(storeId, token) {
   let page = 1;
   const per_page = 200;
   const all = [];
-
   while (true) {
     const data = await tnFetch(storeId, token, `/products?page=${page}&per_page=${per_page}`);
     if (!Array.isArray(data) || data.length === 0) break;
@@ -292,7 +271,6 @@ async function fetchAllProducts(storeId, token) {
     if (data.length < per_page) break;
     page += 1;
   }
-
   return all;
 }
 
@@ -309,23 +287,18 @@ async function getPublicDomain(req, storeId, token) {
   // 2) /domains (si hay permiso)
   try {
     const arr = await tnFetch(storeId, token, '/domains');
-    // puede venir como [{domain:"..."}, ...] o strings
     const domains = Array.isArray(arr) ? arr.map((d) => normalizeDomain(d?.domain ?? d)) : [];
     const pick = pickBestDomain(domains);
     if (pick) return pick;
-  } catch (_e) {
-    // 403/401/404: ignorar y seguir a /store
-  }
+  } catch (_) {}
 
   // 3) /store (si existe/permiso)
   try {
     const store = await tnFetch(storeId, token, '/store');
-    // distintas formas posibles
-    const domainsFromStore = Array.isArray(store?.domains)
-      ? store.domains
-      : Array.isArray(store?.domain)
-      ? store.domain
-      : null;
+    const domainsFromStore =
+      Array.isArray(store?.domains) ? store.domains :
+      Array.isArray(store?.domain) ? store.domain :
+      null;
 
     const pick =
       pickBestDomain(domainsFromStore) ||
@@ -333,24 +306,10 @@ async function getPublicDomain(req, storeId, token) {
       normalizeDomain(store?.store_domain);
 
     if (pick && isLikelyHost(pick)) return pick;
-  } catch (_e) {
-    // ignorar
-  }
+  } catch (_) {}
 
   // 4) fallback
   return `${storeId}.tiendanube.com`;
-}
-
-/* =========================
-   Parseo simple de cookies
-   ========================= */
-function parseCookies(cookieHeader) {
-  if (!cookieHeader) return {};
-  return cookieHeader.split(';').reduce((acc, part) => {
-    const [name, ...rest] = part.trim().split('=');
-    acc[name] = decodeURIComponent(rest.join('='));
-    return acc;
-  }, {});
 }
 
 /* =========================
@@ -366,7 +325,6 @@ app.get('/', async (req, res) => {
 
   const appUrl = process.env.APP_URL || 'https://tn-feed-app.vercel.app';
   const installUrl = getInstallUrl();
-
   res.type('html').send(`<!doctype html>
 <html lang="es">
 <head>
@@ -390,7 +348,6 @@ app.get('/', async (req, res) => {
   <div class="wrap">
     <h1>XML Nube by Sacu Partner Tecnológico Tiendanube</h1>
     <p>Generá un feed compatible con Google Merchant. Instalá la app y luego accedé a tu enlace <small><code>/feed.xml?store_id=…</code></small>.</p>
-    <!-- IMPORTANTE: target _top para romper el iframe de Tiendanube -->
     <a class="cta" href="${installUrl}" target="_top">Instalar en mi tienda</a>
     <div class="card">
       <form action="/dashboard" method="get">
@@ -433,7 +390,7 @@ app.get('/dashboard', async (req, res) => {
     .warn { background:#fff3cd; color:#7c4a03; border:1px solid #ffecb5 }
     input[type="text"] { width:100%; padding:.55rem .6rem; border:1px solid #d1d5db; border-radius:.4rem; }
     .row { display:flex; gap:.5rem; margin-top:.5rem }
-    .btn { padding:.55rem .8rem; border:0; border-radius:.4rem; background:var(--brand); color:#fff; cursor:pointer; }
+    .btn { padding:.55rem .8rem; border:0; border-radius:.4rem; background:var(--brand); color:#fff; }
     .muted { color:#666 }
     .box { border:1px solid #e5e7eb; border-radius:.5rem; padding:1rem; margin-top:1rem; background:#fafafa }
     a { color:var(--brand); text-decoration:none }
@@ -441,16 +398,12 @@ app.get('/dashboard', async (req, res) => {
 </head>
 <body>
   <div class="wrap">
-    <h2>Conectar a Tiendanube ${
-      has ? '<span class="badge ok">Autenticado</span>' : '<span class="badge warn">Falta instalar</span>'
-    }</h2>
+    <h2>Conectar a Tiendanube ${has ? '<span class="badge ok">Autenticado</span>' : '<span class="badge warn">Falta instalar</span>'}</h2>
     <p class="muted">Estado de la conexión con tu tienda.</p>
 
     <div class="box">
       <h3>Catálogo ${has ? '<span class="badge ok">Catálogo encontrado</span>' : ''}</h3>
-      ${
-        has
-          ? `
+      ${has ? `
         <label for="url"><small>Copiá tu URL de catálogo:</small></label>
         <div class="row">
           <input id="url" type="text" readonly value="${feedUrl}" />
@@ -458,14 +411,12 @@ app.get('/dashboard', async (req, res) => {
           <a class="btn" href="${feedUrl}" target="_blank" style="background:#374151">Abrir</a>
         </div>
         <p class="muted" style="margin-top:.5rem">Este enlace es el que pegás en Google Merchant u otros destinos.</p>
-      `
-          : `
+      ` : `
         <p>Ingresá desde la <a href="/">landing</a> tu <code>store_id</code> o instalá la app.</p>
         <p style="margin-top:1rem">
           <a class="btn" href="${installUrl}" target="_top">Instalar en mi tienda</a>
         </p>
-      `
-      }
+      `}
     </div>
   </div>
 </body>
@@ -476,7 +427,6 @@ app.get('/dashboard', async (req, res) => {
    OAuth callback: guarda token, setea cookie y registra webhook
    ========================= */
 app.get('/install', (_req, res) => {
-  // si alguien entra directo desde fuera del admin
   res.redirect(getInstallUrl());
 });
 
@@ -496,19 +446,23 @@ app.get('/oauth/callback', async (req, res) => {
       }),
     });
 
-    const data = await resp.json();
+    const data = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       console.error('[OAuth] Error intercambiando code:', data);
       return res.status(500).send('Failed to obtain access token');
     }
 
-    const { access_token, user_id } = data;
-    if (!access_token || !user_id) {
-      console.error('[OAuth] Respuesta inválida:', data);
+    // ==========================
+    // FIX CRÍTICO: usar store_id real (NO user_id)
+    // ==========================
+    const { access_token, store_id } = data;
+
+    if (!access_token || !store_id) {
+      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', data);
       return res.status(500).send('Invalid token response from Tiendanube');
     }
 
-    const storeId = String(user_id);
+    const storeId = String(store_id);
     await saveToken(storeId, access_token);
 
     // Setea cookie store_id válida en iframe: SameSite=None; Secure
@@ -531,7 +485,6 @@ app.get('/oauth/callback', async (req, res) => {
         },
         body: JSON.stringify({ event: 'app/uninstalled', url: webhookUrl }),
       });
-
       const whData = await whResp.json().catch(() => ({}));
       if (!whResp.ok) {
         console.error('[Webhook] Error registrando webhook app/uninstalled:', whData);
@@ -542,10 +495,10 @@ app.get('/oauth/callback', async (req, res) => {
       console.error('[Webhook] Error registrando webhook:', whErr);
     }
 
-    res.redirect(`/dashboard?store_id=${storeId}`);
+    return res.redirect(`/dashboard?store_id=${storeId}`);
   } catch (err) {
     console.error('[OAuth] Error callback:', err);
-    res.status(500).send('Error processing OAuth callback');
+    return res.status(500).send('Error processing OAuth callback');
   }
 });
 
@@ -565,16 +518,6 @@ function buildXmlFeed(products, storeDomain) {
     return String(val);
   }
 
-  // Escape mínimo para XML en textos no-CDATA (por seguridad)
-  function escXml(s) {
-    return String(s ?? '')
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&apos;');
-  }
-
   const safeDomain = normalizeDomain(storeDomain) || 'invalid-domain';
 
   const items = products.map((p) => {
@@ -586,46 +529,12 @@ function buildXmlFeed(products, storeDomain) {
     const link = productLink(safeDomain, handleSlug);
 
     const imageUrl =
-      Array.isArray(p.images) && p.images.length > 0
-        ? (p.images[0].src || p.images[0].url || '')
-        : '';
+      Array.isArray(p.images) && p.images.length > 0 ? (p.images[0].src || p.images[0].url || '') : '';
 
-    // Precios: Tiendanube suele traer price y promotional_price por variante
     let price = '0.00';
-    let salePrice = null;
-
     if (Array.isArray(p.variants) && p.variants.length > 0) {
-      const v0 = p.variants[0];
-
-      const basePrice = v0.price ?? v0.promotional_price;
-      if (basePrice !== undefined && basePrice !== null && basePrice !== '') {
-        price = String(basePrice);
-      }
-
-      // Campo de precio con descuento (Google Merchant: g:sale_price)
-      // Si hay promotional_price distinto a price, lo mando como sale_price.
-      const vPrice = v0.price;
-      const vPromo = v0.promotional_price;
-
-      if (
-        vPrice !== undefined &&
-        vPromo !== undefined &&
-        vPrice !== null &&
-        vPromo !== null &&
-        String(vPromo) !== '' &&
-        String(vPrice) !== '' &&
-        String(vPromo) !== String(vPrice)
-      ) {
-        // En Tiendanube a veces promo es el precio final; price es el original
-        // Si promo < price => sale_price
-        const nPrice = Number(vPrice);
-        const nPromo = Number(vPromo);
-        if (!Number.isNaN(nPrice) && !Number.isNaN(nPromo) && nPromo < nPrice) {
-          // En este caso: g:price debe ser el original, g:sale_price el promo
-          price = String(vPrice);
-          salePrice = String(vPromo);
-        }
-      }
+      const variantPrice = p.variants[0].price || p.variants[0].promotional_price;
+      if (variantPrice) price = String(variantPrice);
     }
 
     const currency = 'ARS';
@@ -641,8 +550,6 @@ function buildXmlFeed(products, storeDomain) {
       }
     }
 
-    // BRAND: si no viene, NO ponemos Media Naranja fijo.
-    // Google Merchant acepta omitir g:brand; si querés un default por tienda, lo hacemos luego.
     let brandVal = '';
     if (p.brand) {
       if (typeof p.brand === 'object' && p.brand.name) {
@@ -651,32 +558,22 @@ function buildXmlFeed(products, storeDomain) {
         brandVal = getLocalized(p.brand);
       }
     }
+    if (!brandVal) brandVal = 'Media Naranja';
 
-    const lines = [
+    return [
       '  <item>',
-      `    <g:id>${escXml(productId)}</g:id>`,
+      `    <g:id>${productId}</g:id>`,
       `    <g:title><![CDATA[${title}]]></g:title>`,
       `    <g:description><![CDATA[${description}]]></g:description>`,
-      `    <g:link>${escXml(link)}</g:link>`,
-      `    <g:image_link>${escXml(imageUrl)}</g:image_link>`,
+      `    <g:link>${link}</g:link>`,
+      `    <g:image_link>${imageUrl}</g:image_link>`,
       `    <g:availability>${availability}</g:availability>`,
-      `    <g:price>${escXml(price)} ${currency}</g:price>`,
-    ];
-
-    if (salePrice) {
-      lines.push(`    <g:sale_price>${escXml(salePrice)} ${currency}</g:sale_price>`);
-    }
-
-    lines.push('    <g:condition>new</g:condition>');
-
-    if (brandVal) {
-      lines.push(`    <g:brand><![CDATA[${brandVal}]]></g:brand>`);
-    }
-
-    lines.push('    <g:identifier_exists>false</g:identifier_exists>');
-    lines.push('  </item>');
-
-    return lines.join('\n');
+      `    <g:price>${price} ${currency}</g:price>`,
+      '    <g:condition>new</g:condition>',
+      `    <g:brand><![CDATA[${brandVal}]]></g:brand>`,
+      '    <g:identifier_exists>false</g:identifier_exists>',
+      '  </item>',
+    ].join('\n');
   });
 
   return [
@@ -702,9 +599,7 @@ app.get('/feed.xml', async (req, res) => {
       return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
     }
 
-    // dominio público robusto
     const storeDomain = await getPublicDomain(req, store_id, token);
-
     const products = await fetchAllProducts(store_id, token);
     const xml = buildXmlFeed(products, storeDomain);
 
@@ -723,7 +618,6 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
   try {
     const hmacHeader =
       req.headers['x-linkedstore-hmac-sha256'] || req.headers['http_x_linkedstore_hmac_sha256'];
-
     const raw = JSON.stringify(req.body || {});
     const secret = process.env.TN_CLIENT_SECRET || '';
     const digest = crypto.createHmac('sha256', secret).update(raw).digest('hex');
@@ -739,7 +633,6 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
       await deleteToken(String(store_id));
       console.log(`[Webhook] app/uninstalled recibido. store_id=${store_id} -> token eliminado`);
     }
-
     return res.status(200).send('OK');
   } catch (e) {
     console.error('[Webhook] Error procesando webhook:', e);
@@ -753,7 +646,6 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
 if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
     try {
-      await initDbOnce();
       if (!pool) return res.json({ ok: false, reason: 'no-pool' });
       const c = await pool.connect();
       await c.query('SELECT 1');
@@ -766,10 +658,9 @@ if (process.env.DEBUG === 'true') {
 
   app.get('/debug/tokens', async (_req, res) => {
     try {
-      await initDbOnce();
-      if (!pool)
+      if (!pool) {
         return res.json({ rows: Object.keys(storeTokens).map((s) => ({ store_id: s })) });
-
+      }
       const { rows } = await pool.query(
         'SELECT store_id, created_at FROM tokens ORDER BY created_at DESC LIMIT 50'
       );
@@ -779,14 +670,11 @@ if (process.env.DEBUG === 'true') {
     }
   });
 
-  // útil para debug del dominio
   app.get('/debug/domain', async (req, res) => {
     const store_id = req.query.store_id;
     if (!store_id) return res.status(400).json({ error: 'missing store_id' });
-
     const token = await getToken(store_id);
     if (!token) return res.status(401).json({ error: 'no token' });
-
     const domain = await getPublicDomain(req, store_id, token);
     res.json({ store_id, domain });
   });
@@ -799,5 +687,4 @@ const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
-
 module.exports = app;
