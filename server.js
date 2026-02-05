@@ -248,12 +248,6 @@ function resolveBrandOverride(storeId) {
   return hit.split(':').slice(1).join(':').trim();
 }
 
-// Heurística de marca por producto/variant:
-// 1) override por tienda (BRAND_MAP)
-// 2) brand del producto (p.brand / p.brand.name / p.brand.es)
-// 3) vendor / manufacturer / attributes relacionados
-// 4) DEFAULT_BRAND (si existe)
-// 5) string vacío (y el tag <g:brand> NO se emite)
 function getBrandForProduct(storeId, p) {
   const override = resolveBrandOverride(storeId);
   if (override) return override;
@@ -263,18 +257,15 @@ function getBrandForProduct(storeId, p) {
     if (typeof p.brand === 'object' && p.brand.name) brandVal = getLocalized(p.brand.name);
     else brandVal = getLocalized(p.brand);
   }
-
   if (!brandVal && p?.vendor) brandVal = getLocalized(p.vendor);
   if (!brandVal && p?.manufacturer) brandVal = getLocalized(p.manufacturer);
 
-  // A veces viene como "attributes" o "properties"
   if (!brandVal && p?.attributes && typeof p.attributes === 'object') {
     const possible = p.attributes.brand || p.attributes.marca;
     if (possible) brandVal = getLocalized(possible);
   }
 
   brandVal = String(brandVal || '').trim();
-
   if (!brandVal && DEFAULT_BRAND) brandVal = DEFAULT_BRAND.trim();
   return brandVal || '';
 }
@@ -364,7 +355,7 @@ function parseCookies(cookieHeader) {
 }
 
 /* =========================
-   Landing + Dashboard (igual que antes)
+   Landing + Dashboard
    ========================= */
 app.get('/', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
@@ -498,9 +489,7 @@ app.get('/oauth/callback', async (req, res) => {
       return res.status(500).send('Failed to obtain access token');
     }
 
-    // FIX: usar store_id (no user_id)
-    const { access_token, store_id } = data;
-
+    const { access_token, store_id } = data; // ✅ store_id real
     if (!access_token || !store_id) {
       console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', data);
       return res.status(500).send('Invalid token response from Tiendanube');
@@ -540,11 +529,11 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Feed: soporte multi-variant + sale_price + cache + métricas
+   Feed: multi-variant + sale_price + cache + métricas + item_group_id
    ========================= */
 
 // Métricas por tienda (en memoria)
-const storeMetrics = new Map(); // store_id -> metrics
+const storeMetrics = new Map();
 function getMetrics(storeId) {
   const sid = String(storeId);
   if (!storeMetrics.has(sid)) {
@@ -595,7 +584,6 @@ function toMoney(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
-  // Google acepta "14999.00 ARS"; Tiendanube suele devolver string ya, pero normalizamos a 2 decimales
   return n.toFixed(2);
 }
 
@@ -604,8 +592,6 @@ function normalizeText(s) {
 }
 
 function chooseImage(p, v) {
-  // Preferir imagen del variant si existiera, sino primera del producto
-  // Tiendanube: a veces variant.image_id apunta a images[].id
   const imgs = Array.isArray(p?.images) ? p.images : [];
   if (v && v.image_id && imgs.length) {
     const hit = imgs.find((im) => String(im.id) === String(v.image_id));
@@ -615,7 +601,7 @@ function chooseImage(p, v) {
   return '';
 }
 
-// Devuelve items ya “aplanados” según modo de variantes
+// Devuelve items “aplanados” según modo de variantes
 function flattenItems(products) {
   const items = [];
   for (const p of products) {
@@ -628,6 +614,7 @@ function flattenItems(products) {
     if (!variants.length) {
       items.push({
         item_id: productId,
+        item_group_id: productId, // ✅ group aunque no haya variants
         title: titleBase,
         description: descBase,
         handleSlug,
@@ -645,7 +632,6 @@ function flattenItems(products) {
       const v = variants[0];
       items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
     } else {
-      // split: 1 item por variante (recomendado para Merchant)
       for (const v of variants) {
         items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
       }
@@ -658,13 +644,12 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
   const variantId = v?.id != null ? String(v.id) : '';
   const item_id = variantId ? `${productId}-${variantId}` : productId;
 
-  // Título: base + nombre variante (si aporta)
   const variantName = normalizeText(getLocalized(v?.name));
-  const title = variantName && variantName.toLowerCase() !== 'default'
-    ? `${titleBase} - ${variantName}`
-    : titleBase;
+  const title =
+    variantName && variantName.toLowerCase() !== 'default'
+      ? `${titleBase} - ${variantName}`
+      : titleBase;
 
-  // Precio regular y promo
   const regular = toMoney(v?.price);
   const promo = toMoney(v?.promotional_price);
 
@@ -672,19 +657,14 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
   let sale_price = null;
 
   if (regular && promo) {
-    // si promo < regular => sale_price
     const r = Number(regular);
     const pnum = Number(promo);
     if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
       price = regular;
       sale_price = promo;
-    } else {
-      // si promo no es menor, ignoramos sale_price
-      sale_price = null;
     }
   }
 
-  // Stock / disponibilidad
   let availability = 'out_of_stock';
   if (!v?.stock_management) {
     availability = 'in_stock';
@@ -695,6 +675,7 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
 
   return {
     item_id,
+    item_group_id: productId, // ✅ Google Merchant: agrupa variantes
     title,
     description: descBase,
     handleSlug,
@@ -716,14 +697,16 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
-    // Por seguridad: si no hay price, no emitimos item (Merchant lo suele rechazar)
-    // Si querés incluirlos igual, comentá este if.
+    // Si no hay price, no emitimos item (Merchant lo suele rechazar)
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
 
     lines.push('  <item>');
     lines.push(`    <g:id>${xmlEscape(it.item_id)}</g:id>`);
+    // ✅ nuevo
+    if (it.item_group_id) lines.push(`    <g:item_group_id>${xmlEscape(it.item_group_id)}</g:item_group_id>`);
+
     lines.push(`    <g:title><![CDATA[${safeCdata(it.title)}]]></g:title>`);
     lines.push(`    <g:description><![CDATA[${safeCdata(it.description)}]]></g:description>`);
     lines.push(`    <g:link>${xmlEscape(link)}</g:link>`);
@@ -733,17 +716,16 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
-    // ✅ g:sale_price (si corresponde)
+    // ✅ sale_price si corresponde
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
 
-    // ✅ brand “correcto”: si está vacío, no lo mandamos (evita "Media Naranja" para todos)
+    // ✅ brand sólo si existe (no mentimos)
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
 
-    // Si en algún momento querés GTIN/MPN reales, esto hay que hacerlo configurable
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
     lines.push('  </item>');
   }
@@ -901,15 +883,12 @@ if (process.env.DEBUG === 'true') {
     res.json({ store_id: String(store_id), domain });
   });
 
-  // ✅ Métricas por tienda
   app.get('/debug/metrics', async (req, res) => {
     const store_id = req.query.store_id;
     if (store_id) return res.json(getMetrics(String(store_id)));
-    // lista todas (útil para operar)
     return res.json({ stores: Array.from(storeMetrics.values()) });
   });
 
-  // ✅ Cache status
   app.get('/debug/cache', async (req, res) => {
     const store_id = req.query.store_id;
     if (!store_id) {
