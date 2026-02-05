@@ -19,7 +19,7 @@ let pool;
 
 // Devuelve la mejor cadena de conexión disponible (Neon / Vercel Postgres / fallback)
 function getConnectionString() {
-  // En producción usa solo DATABASE_URL
+  // En producción usa solo DATABASE_URL (Neon/Vercel la proveen)
   if (process.env.NODE_ENV === 'production') {
     return process.env.DATABASE_URL || null;
   }
@@ -52,7 +52,6 @@ function getConnectionString() {
   }
 })();
 
-/** Crea tabla tokens si no existe */
 async function ensureSchema() {
   if (!pool) return;
   await pool.query(`
@@ -69,7 +68,6 @@ async function ensureSchema() {
 // Fallback en memoria (mientras no haya DB)
 const storeTokens = Object.create(null);
 
-/** Guarda/actualiza token (DB si hay; si no, memoria) */
 async function saveToken(storeId, accessToken) {
   storeTokens[storeId] = accessToken;
   if (!pool) return;
@@ -88,7 +86,6 @@ async function saveToken(storeId, accessToken) {
   }
 }
 
-/** Obtiene token por store_id (prefiere DB; si falla, memoria) */
 async function getToken(storeId) {
   if (pool) {
     try {
@@ -104,15 +101,13 @@ async function getToken(storeId) {
   return storeTokens[storeId] || null;
 }
 
-/** Chequea si hay token persistido */
 async function hasToken(storeId) {
   if (!storeId) return false;
   if (pool) {
     try {
-      const { rows } = await pool.query(
-        'SELECT 1 FROM tokens WHERE store_id = $1 LIMIT 1',
-        [storeId]
-      );
+      const { rows } = await pool.query('SELECT 1 FROM tokens WHERE store_id = $1 LIMIT 1', [
+        storeId,
+      ]);
       return rows.length > 0;
     } catch (e) {
       console.error('[DB] hasToken error:', e);
@@ -121,9 +116,6 @@ async function hasToken(storeId) {
   return !!storeTokens[storeId];
 }
 
-/**
- * Elimina el token de una tienda (memoria + DB). Usado en app/uninstalled.
- */
 async function deleteToken(storeId) {
   delete storeTokens[storeId];
   if (!pool) return;
@@ -136,46 +128,48 @@ async function deleteToken(storeId) {
 }
 
 /* =========================
-   Config de marca (colores / logo)
+   Config / Env
    ========================= */
 const BRAND_PRIMARY = process.env.BRAND_PRIMARY || '#0f6fff';
 const BRAND_ACCENT = process.env.BRAND_ACCENT || '#00b2ff';
 const LOGO_URL = process.env.LOGO_URL || 'https://www.sacudigital.com/apps-sacu/feedxml/logo.png';
 
+// Cache feed (in-memory per instancia)
+const FEED_CACHE_TTL_SECONDS = Number(process.env.FEED_CACHE_TTL_SECONDS || '300'); // 5m default
+const VARIANT_MODE = (process.env.VARIANT_MODE || 'split').toLowerCase(); // split | first
+// Defaults de marca
+const DEFAULT_BRAND = process.env.DEFAULT_BRAND || ''; // fallback global (si no se detecta marca)
+const BRAND_MAP = process.env.BRAND_MAP || ''; // "2307236:Los Locos,6467092:VRX"
+
 /* =========================
    Helpers Tiendanube
    ========================= */
 
-// Genera la URL de instalación en Tiendanube usando TN_CLIENT_ID.
 function getInstallUrl(state = '') {
   const appId = process.env.TN_CLIENT_ID;
   const baseUrl = `https://www.tiendanube.com/apps/${appId}/authorize`;
   return state ? `${baseUrl}?state=${state}` : baseUrl;
 }
 
-// Construye la URL de la API OAuth de Tiendanube
 function getTokenExchangeUrl() {
   return 'https://www.tiendanube.com/apps/authorize/token';
 }
 
-// --- NUEVO: normalización robusta (EVITA [object Object])
+/* =========================
+   Normalización / seguridad XML
+   ========================= */
+
 function normalizeDomain(val) {
   if (!val) return null;
-
-  if (typeof val === 'string') {
-    return val.trim().replace(/^https?:\/\//i, '').replace(/\/+$/g, '');
-  }
+  if (typeof val === 'string') return val.trim().replace(/^https?:\/\//i, '').replace(/\/+$/g, '');
   if (typeof val === 'number') return String(val);
 
-  // objeto típico: { domain: "..."} o { url: "https://..."} o { es: "..."} etc.
   if (typeof val === 'object') {
     if (val.domain) return normalizeDomain(val.domain);
     if (val.url) return normalizeDomain(val.url);
     if (val.name) return normalizeDomain(val.name);
     if (val.host) return normalizeDomain(val.host);
     if (val.es) return normalizeDomain(val.es);
-
-    // último recurso: evitar [object Object]
     const s = String(val);
     if (s === '[object Object]') return null;
     return normalizeDomain(s);
@@ -185,21 +179,16 @@ function normalizeDomain(val) {
 
 function isLikelyHost(h) {
   if (!h) return false;
-  // host simple (sin protocolo)
   return /^(?:[a-z0-9-]+\.)+[a-z]{2,}$/i.test(h);
 }
 
 function pickBestDomain(domains) {
   const list = (domains || []).map(normalizeDomain).filter(Boolean);
-
   if (!list.length) return null;
-
-  // preferir custom (no *.tiendanube.com)
   const custom = list.find((d) => !/\.tiendanube\.com$/i.test(d));
   return custom || list[0];
 }
 
-// override por query o por env DOMAINS_MAP="6467092:vertexretail.com.ar,2307236:loslocos.com.ar"
 function resolveDomainOverrides(req, storeId) {
   const q = normalizeDomain(req.query.domain);
   if (q && isLikelyHost(q) && !/\.tiendanube\.com$/i.test(q)) return q;
@@ -217,31 +206,88 @@ function resolveDomainOverrides(req, storeId) {
   return null;
 }
 
-// Función para construir enlaces de productos (blindada)
 function productLink(storeDomain, handle) {
   const host = normalizeDomain(storeDomain) || 'invalid-domain';
   return `https://${host}/productos/${handle}/?utm_source=xml`;
 }
 
-// Parseo simple de cookies
-function parseCookies(cookieHeader) {
-  if (!cookieHeader) return {};
-  return cookieHeader.split(';').reduce((acc, part) => {
-    const [name, ...rest] = part.trim().split('=');
-    acc[name] = decodeURIComponent(rest.join('='));
-    return acc;
-  }, {});
+function xmlEscape(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function safeCdata(s) {
+  // Evita romper CDATA con "]]>"
+  return String(s || '').replace(/\]\]>/g, ']]]]><![CDATA[>');
+}
+
+function getLocalized(val) {
+  if (val === undefined || val === null) return '';
+  if (typeof val === 'object') {
+    if (val.es) return val.es;
+    const keys = Object.keys(val);
+    return keys.length > 0 ? val[keys[0]] : '';
+  }
+  return String(val);
 }
 
 /* =========================
-   API Tiendanube: fetch helpers
+   Marca: lógica correcta
    ========================= */
 
-// Petición autenticada a la API de Tiendanube
+function resolveBrandOverride(storeId) {
+  const mapStr = BRAND_MAP || '';
+  if (!mapStr) return '';
+  const pairs = mapStr.split(',').map((s) => s.trim()).filter(Boolean);
+  const hit = pairs.find((p) => p.startsWith(String(storeId) + ':'));
+  if (!hit) return '';
+  return hit.split(':').slice(1).join(':').trim();
+}
+
+// Heurística de marca por producto/variant:
+// 1) override por tienda (BRAND_MAP)
+// 2) brand del producto (p.brand / p.brand.name / p.brand.es)
+// 3) vendor / manufacturer / attributes relacionados
+// 4) DEFAULT_BRAND (si existe)
+// 5) string vacío (y el tag <g:brand> NO se emite)
+function getBrandForProduct(storeId, p) {
+  const override = resolveBrandOverride(storeId);
+  if (override) return override;
+
+  let brandVal = '';
+  if (p?.brand) {
+    if (typeof p.brand === 'object' && p.brand.name) brandVal = getLocalized(p.brand.name);
+    else brandVal = getLocalized(p.brand);
+  }
+
+  if (!brandVal && p?.vendor) brandVal = getLocalized(p.vendor);
+  if (!brandVal && p?.manufacturer) brandVal = getLocalized(p.manufacturer);
+
+  // A veces viene como "attributes" o "properties"
+  if (!brandVal && p?.attributes && typeof p.attributes === 'object') {
+    const possible = p.attributes.brand || p.attributes.marca;
+    if (possible) brandVal = getLocalized(possible);
+  }
+
+  brandVal = String(brandVal || '').trim();
+
+  if (!brandVal && DEFAULT_BRAND) brandVal = DEFAULT_BRAND.trim();
+  return brandVal || '';
+}
+
+/* =========================
+   API Tiendanube
+   ========================= */
+
 async function tnFetch(storeId, token, path) {
   const base = `https://api.tiendanube.com/v1/${storeId}`;
   const url = `${base}${path}`;
   const ua = process.env.TN_USER_AGENT || 'feed-xml-by-sacu (contacto@sacudigital.com)';
+
   const res = await fetch(url, {
     headers: {
       'Content-Type': 'application/json',
@@ -259,7 +305,6 @@ async function tnFetch(storeId, token, path) {
   return res.json();
 }
 
-// Pagina productos
 async function fetchAllProducts(storeId, token) {
   let page = 1;
   const per_page = 200;
@@ -275,16 +320,13 @@ async function fetchAllProducts(storeId, token) {
 }
 
 /* =========================
-   Dominio público (sin romper por scopes)
-   Orden: query -> DOMAINS_MAP -> /domains -> /store -> fallback
+   Dominio público: query -> DOMAINS_MAP -> /domains -> /store -> fallback
    ========================= */
-
 async function getPublicDomain(req, storeId, token) {
-  // 1) overrides (query / env)
   const override = resolveDomainOverrides(req, storeId);
   if (override) return override;
 
-  // 2) /domains (si hay permiso)
+  // /domains
   try {
     const arr = await tnFetch(storeId, token, '/domains');
     const domains = Array.isArray(arr) ? arr.map((d) => normalizeDomain(d?.domain ?? d)) : [];
@@ -292,13 +334,11 @@ async function getPublicDomain(req, storeId, token) {
     if (pick) return pick;
   } catch (_) {}
 
-  // 3) /store (si existe/permiso)
+  // /store
   try {
     const store = await tnFetch(storeId, token, '/store');
     const domainsFromStore =
-      Array.isArray(store?.domains) ? store.domains :
-      Array.isArray(store?.domain) ? store.domain :
-      null;
+      Array.isArray(store?.domains) ? store.domains : Array.isArray(store?.domain) ? store.domain : null;
 
     const pick =
       pickBestDomain(domainsFromStore) ||
@@ -308,12 +348,23 @@ async function getPublicDomain(req, storeId, token) {
     if (pick && isLikelyHost(pick)) return pick;
   } catch (_) {}
 
-  // 4) fallback
   return `${storeId}.tiendanube.com`;
 }
 
 /* =========================
-   Landing + Auto-redirect si hay cookie/token
+   Cookies
+   ========================= */
+function parseCookies(cookieHeader) {
+  if (!cookieHeader) return {};
+  return cookieHeader.split(';').reduce((acc, part) => {
+    const [name, ...rest] = part.trim().split('=');
+    acc[name] = decodeURIComponent(rest.join('='));
+    return acc;
+  }, {});
+}
+
+/* =========================
+   Landing + Dashboard (igual que antes)
    ========================= */
 app.get('/', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
@@ -362,9 +413,6 @@ app.get('/', async (req, res) => {
 </html>`);
 });
 
-/* =========================
-   Panel por tienda
-   ========================= */
 app.get('/dashboard', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
   const store_id = req.query.store_id || cookies.store_id;
@@ -424,11 +472,9 @@ app.get('/dashboard', async (req, res) => {
 });
 
 /* =========================
-   OAuth callback: guarda token, setea cookie y registra webhook
+   OAuth callback (FIX CRÍTICO: usar store_id real)
    ========================= */
-app.get('/install', (_req, res) => {
-  res.redirect(getInstallUrl());
-});
+app.get('/install', (_req, res) => res.redirect(getInstallUrl()));
 
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
@@ -452,9 +498,7 @@ app.get('/oauth/callback', async (req, res) => {
       return res.status(500).send('Failed to obtain access token');
     }
 
-    // ==========================
-    // FIX CRÍTICO: usar store_id real (NO user_id)
-    // ==========================
+    // FIX: usar store_id (no user_id)
     const { access_token, store_id } = data;
 
     if (!access_token || !store_id) {
@@ -465,12 +509,8 @@ app.get('/oauth/callback', async (req, res) => {
     const storeId = String(store_id);
     await saveToken(storeId, access_token);
 
-    // Setea cookie store_id válida en iframe: SameSite=None; Secure
     const maxAge = 60 * 60 * 24 * 30; // 30 días
-    res.setHeader(
-      'Set-Cookie',
-      `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`
-    );
+    res.setHeader('Set-Cookie', `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`);
 
     // Registrar webhook app/uninstalled
     try {
@@ -486,11 +526,8 @@ app.get('/oauth/callback', async (req, res) => {
         body: JSON.stringify({ event: 'app/uninstalled', url: webhookUrl }),
       });
       const whData = await whResp.json().catch(() => ({}));
-      if (!whResp.ok) {
-        console.error('[Webhook] Error registrando webhook app/uninstalled:', whData);
-      } else {
-        console.log('[Webhook] app/uninstalled registrado');
-      }
+      if (!whResp.ok) console.error('[Webhook] Error registrando webhook app/uninstalled:', whData);
+      else console.log('[Webhook] app/uninstalled registrado');
     } catch (whErr) {
       console.error('[Webhook] Error registrando webhook:', whErr);
     }
@@ -503,87 +540,222 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Feed XML on-demand (dominio público robusto)
+   Feed: soporte multi-variant + sale_price + cache + métricas
    ========================= */
 
-function buildXmlFeed(products, storeDomain) {
-  // Helper para extraer el valor localizado (es -> fallback)
-  function getLocalized(val) {
-    if (val === undefined || val === null) return '';
-    if (typeof val === 'object') {
-      if (val.es) return val.es;
-      const keys = Object.keys(val);
-      return keys.length > 0 ? val[keys[0]] : '';
+// Métricas por tienda (en memoria)
+const storeMetrics = new Map(); // store_id -> metrics
+function getMetrics(storeId) {
+  const sid = String(storeId);
+  if (!storeMetrics.has(sid)) {
+    storeMetrics.set(sid, {
+      store_id: sid,
+      feed_requests: 0,
+      feed_cache_hits: 0,
+      feed_304: 0,
+      feed_errors: 0,
+      last_error: null,
+      last_generated_at: null,
+      last_generation_ms: null,
+      last_products_count: null,
+      last_items_count: null,
+      last_domain: null,
+    });
+  }
+  return storeMetrics.get(sid);
+}
+
+// Cache por tienda
+const feedCache = new Map(); // store_id -> { xml, etag, expiresAt, generatedAt }
+function getCached(storeId) {
+  const sid = String(storeId);
+  const c = feedCache.get(sid);
+  if (!c) return null;
+  if (Date.now() > c.expiresAt) {
+    feedCache.delete(sid);
+    return null;
+  }
+  return c;
+}
+function setCached(storeId, xml) {
+  const sid = String(storeId);
+  const etag = crypto.createHash('sha1').update(xml).digest('hex');
+  const now = Date.now();
+  const ttlMs = Math.max(0, FEED_CACHE_TTL_SECONDS) * 1000;
+  feedCache.set(sid, {
+    xml,
+    etag,
+    generatedAt: now,
+    expiresAt: now + ttlMs,
+  });
+  return { etag };
+}
+
+function toMoney(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  // Google acepta "14999.00 ARS"; Tiendanube suele devolver string ya, pero normalizamos a 2 decimales
+  return n.toFixed(2);
+}
+
+function normalizeText(s) {
+  return String(s || '').trim();
+}
+
+function chooseImage(p, v) {
+  // Preferir imagen del variant si existiera, sino primera del producto
+  // Tiendanube: a veces variant.image_id apunta a images[].id
+  const imgs = Array.isArray(p?.images) ? p.images : [];
+  if (v && v.image_id && imgs.length) {
+    const hit = imgs.find((im) => String(im.id) === String(v.image_id));
+    if (hit) return hit.src || hit.url || '';
+  }
+  if (imgs.length) return imgs[0].src || imgs[0].url || '';
+  return '';
+}
+
+// Devuelve items ya “aplanados” según modo de variantes
+function flattenItems(products) {
+  const items = [];
+  for (const p of products) {
+    const productId = p?.id != null ? String(p.id) : normalizeText(getLocalized(p?.handle));
+    const titleBase = normalizeText(getLocalized(p?.name));
+    const descBase = normalizeText(getLocalized(p?.description)) || titleBase;
+    const handleSlug = normalizeText(getLocalized(p?.handle)) || productId;
+
+    const variants = Array.isArray(p?.variants) ? p.variants : [];
+    if (!variants.length) {
+      items.push({
+        item_id: productId,
+        title: titleBase,
+        description: descBase,
+        handleSlug,
+        image_link: chooseImage(p, null),
+        price: null,
+        sale_price: null,
+        availability: 'out_of_stock',
+        rawProduct: p,
+        rawVariant: null,
+      });
+      continue;
     }
-    return String(val);
+
+    if (VARIANT_MODE === 'first') {
+      const v = variants[0];
+      items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
+    } else {
+      // split: 1 item por variante (recomendado para Merchant)
+      for (const v of variants) {
+        items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
+      }
+    }
+  }
+  return items;
+}
+
+function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) {
+  const variantId = v?.id != null ? String(v.id) : '';
+  const item_id = variantId ? `${productId}-${variantId}` : productId;
+
+  // Título: base + nombre variante (si aporta)
+  const variantName = normalizeText(getLocalized(v?.name));
+  const title = variantName && variantName.toLowerCase() !== 'default'
+    ? `${titleBase} - ${variantName}`
+    : titleBase;
+
+  // Precio regular y promo
+  const regular = toMoney(v?.price);
+  const promo = toMoney(v?.promotional_price);
+
+  let price = regular;
+  let sale_price = null;
+
+  if (regular && promo) {
+    // si promo < regular => sale_price
+    const r = Number(regular);
+    const pnum = Number(promo);
+    if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
+      price = regular;
+      sale_price = promo;
+    } else {
+      // si promo no es menor, ignoramos sale_price
+      sale_price = null;
+    }
   }
 
+  // Stock / disponibilidad
+  let availability = 'out_of_stock';
+  if (!v?.stock_management) {
+    availability = 'in_stock';
+  } else {
+    const st = v?.stock;
+    if (st !== undefined && st !== null && Number(st) > 0) availability = 'in_stock';
+  }
+
+  return {
+    item_id,
+    title,
+    description: descBase,
+    handleSlug,
+    image_link: chooseImage(p, v),
+    price,
+    sale_price,
+    availability,
+    rawProduct: p,
+    rawVariant: v,
+  };
+}
+
+function buildXmlFeed({ items, storeDomain, storeId }) {
   const safeDomain = normalizeDomain(storeDomain) || 'invalid-domain';
+  const currency = 'ARS';
 
-  const items = products.map((p) => {
-    const productId = p.id ? String(p.id) : getLocalized(p.handle);
-    const title = getLocalized(p.name);
-    const description = getLocalized(p.description) || title;
-    const handleSlug = getLocalized(p.handle) || String(p.id);
+  const lines = [];
+  for (const it of items) {
+    const p = it.rawProduct || {};
+    const brandVal = getBrandForProduct(storeId, p);
 
-    const link = productLink(safeDomain, handleSlug);
+    // Por seguridad: si no hay price, no emitimos item (Merchant lo suele rechazar)
+    // Si querés incluirlos igual, comentá este if.
+    if (!it.price) continue;
 
-    const imageUrl =
-      Array.isArray(p.images) && p.images.length > 0 ? (p.images[0].src || p.images[0].url || '') : '';
+    const link = productLink(safeDomain, it.handleSlug);
 
-    let price = '0.00';
-    if (Array.isArray(p.variants) && p.variants.length > 0) {
-      const variantPrice = p.variants[0].price || p.variants[0].promotional_price;
-      if (variantPrice) price = String(variantPrice);
+    lines.push('  <item>');
+    lines.push(`    <g:id>${xmlEscape(it.item_id)}</g:id>`);
+    lines.push(`    <g:title><![CDATA[${safeCdata(it.title)}]]></g:title>`);
+    lines.push(`    <g:description><![CDATA[${safeCdata(it.description)}]]></g:description>`);
+    lines.push(`    <g:link>${xmlEscape(link)}</g:link>`);
+
+    if (it.image_link) lines.push(`    <g:image_link>${xmlEscape(it.image_link)}</g:image_link>`);
+    lines.push(`    <g:availability>${xmlEscape(it.availability)}</g:availability>`);
+
+    lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
+
+    // ✅ g:sale_price (si corresponde)
+    if (it.sale_price) {
+      lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
-    const currency = 'ARS';
+    lines.push('    <g:condition>new</g:condition>');
 
-    // in_stock si alguna variante tiene stock>0 o no gestiona stock
-    let availability = 'out_of_stock';
-    if (Array.isArray(p.variants) && p.variants.length > 0) {
-      for (const v of p.variants) {
-        if (!v.stock_management || (v.stock !== undefined && Number(v.stock) > 0)) {
-          availability = 'in_stock';
-          break;
-        }
-      }
-    }
+    // ✅ brand “correcto”: si está vacío, no lo mandamos (evita "Media Naranja" para todos)
+    if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
 
-    let brandVal = '';
-    if (p.brand) {
-      if (typeof p.brand === 'object' && p.brand.name) {
-        brandVal = getLocalized(p.brand.name);
-      } else {
-        brandVal = getLocalized(p.brand);
-      }
-    }
-    if (!brandVal) brandVal = 'Media Naranja';
-
-    return [
-      '  <item>',
-      `    <g:id>${productId}</g:id>`,
-      `    <g:title><![CDATA[${title}]]></g:title>`,
-      `    <g:description><![CDATA[${description}]]></g:description>`,
-      `    <g:link>${link}</g:link>`,
-      `    <g:image_link>${imageUrl}</g:image_link>`,
-      `    <g:availability>${availability}</g:availability>`,
-      `    <g:price>${price} ${currency}</g:price>`,
-      '    <g:condition>new</g:condition>',
-      `    <g:brand><![CDATA[${brandVal}]]></g:brand>`,
-      '    <g:identifier_exists>false</g:identifier_exists>',
-      '  </item>',
-    ].join('\n');
-  });
+    // Si en algún momento querés GTIN/MPN reales, esto hay que hacerlo configurable
+    lines.push('    <g:identifier_exists>false</g:identifier_exists>');
+    lines.push('  </item>');
+  }
 
   return [
     '<?xml version="1.0" encoding="UTF-8"?>',
     '<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">',
     '<channel>',
     '  <title>Feed de Productos Tiendanube</title>',
-    `  <link>https://${safeDomain}/</link>`,
+    `  <link>https://${xmlEscape(safeDomain)}/</link>`,
     '  <description>Feed generado desde la API de Tiendanube</description>',
-    items.join('\n'),
+    lines.join('\n'),
     '</channel>',
     '</rss>',
   ].join('\n');
@@ -593,19 +765,68 @@ app.get('/feed.xml', async (req, res) => {
   const { store_id } = req.query;
   if (!store_id) return res.status(400).send('Missing store_id');
 
+  const sid = String(store_id);
+  const m = getMetrics(sid);
+  m.feed_requests += 1;
+
   try {
-    const token = await getToken(store_id);
-    if (!token) {
-      return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
+    const token = await getToken(sid);
+    if (!token) return res.status(401).send('No hay token. Instala la app primero para esta tienda.');
+
+    // 1) Cache
+    const cached = getCached(sid);
+    if (cached) {
+      const ifNoneMatch = (req.headers['if-none-match'] || '').replace(/"/g, '');
+      if (ifNoneMatch && ifNoneMatch === cached.etag) {
+        m.feed_304 += 1;
+        res.status(304).end();
+        return;
+      }
+
+      m.feed_cache_hits += 1;
+      res.setHeader('Content-Type', 'text/xml; charset=utf-8');
+      res.setHeader('Cache-Control', `public, max-age=${FEED_CACHE_TTL_SECONDS}`);
+      res.setHeader('ETag', `"${cached.etag}"`);
+      res.send(cached.xml);
+      return;
     }
 
-    const storeDomain = await getPublicDomain(req, store_id, token);
-    const products = await fetchAllProducts(store_id, token);
-    const xml = buildXmlFeed(products, storeDomain);
+    // 2) Generar
+    const t0 = Date.now();
+    const storeDomain = await getPublicDomain(req, sid, token);
+    const products = await fetchAllProducts(sid, token);
+    const flat = flattenItems(products);
+
+    const xml = buildXmlFeed({
+      items: flat,
+      storeDomain,
+      storeId: sid,
+    });
+
+    const { etag } = setCached(sid, xml);
+
+    const ms = Date.now() - t0;
+    m.last_generated_at = new Date().toISOString();
+    m.last_generation_ms = ms;
+    m.last_products_count = Array.isArray(products) ? products.length : null;
+    m.last_items_count = flat.length;
+    m.last_domain = storeDomain;
+
+    // 3) Responder
+    const ifNoneMatch = (req.headers['if-none-match'] || '').replace(/"/g, '');
+    if (ifNoneMatch && ifNoneMatch === etag) {
+      m.feed_304 += 1;
+      res.status(304).end();
+      return;
+    }
 
     res.setHeader('Content-Type', 'text/xml; charset=utf-8');
+    res.setHeader('Cache-Control', `public, max-age=${FEED_CACHE_TTL_SECONDS}`);
+    res.setHeader('ETag', `"${etag}"`);
     res.send(xml);
   } catch (err) {
+    m.feed_errors += 1;
+    m.last_error = String(err?.message || err);
     console.error('[Feed] Error generando feed:', err);
     res.status(500).send('Error generating feed');
   }
@@ -618,6 +839,7 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
   try {
     const hmacHeader =
       req.headers['x-linkedstore-hmac-sha256'] || req.headers['http_x_linkedstore_hmac_sha256'];
+
     const raw = JSON.stringify(req.body || {});
     const secret = process.env.TN_CLIENT_SECRET || '';
     const digest = crypto.createHmac('sha256', secret).update(raw).digest('hex');
@@ -662,7 +884,7 @@ if (process.env.DEBUG === 'true') {
         return res.json({ rows: Object.keys(storeTokens).map((s) => ({ store_id: s })) });
       }
       const { rows } = await pool.query(
-        'SELECT store_id, created_at FROM tokens ORDER BY created_at DESC LIMIT 50'
+        'SELECT store_id, created_at FROM tokens ORDER BY created_at DESC LIMIT 200'
       );
       res.json(rows);
     } catch (e) {
@@ -673,10 +895,41 @@ if (process.env.DEBUG === 'true') {
   app.get('/debug/domain', async (req, res) => {
     const store_id = req.query.store_id;
     if (!store_id) return res.status(400).json({ error: 'missing store_id' });
-    const token = await getToken(store_id);
+    const token = await getToken(String(store_id));
     if (!token) return res.status(401).json({ error: 'no token' });
-    const domain = await getPublicDomain(req, store_id, token);
-    res.json({ store_id, domain });
+    const domain = await getPublicDomain(req, String(store_id), token);
+    res.json({ store_id: String(store_id), domain });
+  });
+
+  // ✅ Métricas por tienda
+  app.get('/debug/metrics', async (req, res) => {
+    const store_id = req.query.store_id;
+    if (store_id) return res.json(getMetrics(String(store_id)));
+    // lista todas (útil para operar)
+    return res.json({ stores: Array.from(storeMetrics.values()) });
+  });
+
+  // ✅ Cache status
+  app.get('/debug/cache', async (req, res) => {
+    const store_id = req.query.store_id;
+    if (!store_id) {
+      return res.json({
+        ttl_seconds: FEED_CACHE_TTL_SECONDS,
+        entries: Array.from(feedCache.entries()).map(([sid, c]) => ({
+          store_id: sid,
+          etag: c.etag,
+          expires_in_ms: Math.max(0, c.expiresAt - Date.now()),
+        })),
+      });
+    }
+    const c = getCached(String(store_id));
+    if (!c) return res.json({ store_id: String(store_id), cached: false });
+    return res.json({
+      store_id: String(store_id),
+      cached: true,
+      etag: c.etag,
+      expires_in_ms: Math.max(0, c.expiresAt - Date.now()),
+    });
   });
 }
 
