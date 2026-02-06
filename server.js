@@ -248,12 +248,6 @@ function resolveBrandOverride(storeId) {
   return hit.split(':').slice(1).join(':').trim();
 }
 
-// Heurística de marca por producto/variant:
-// 1) override por tienda (BRAND_MAP)
-// 2) brand del producto (p.brand / p.brand.name / p.brand.es)
-// 3) vendor / manufacturer / attributes relacionados
-// 4) DEFAULT_BRAND (si existe)
-// 5) string vacío (y el tag <g:brand> NO se emite)
 function getBrandForProduct(storeId, p) {
   const override = resolveBrandOverride(storeId);
   if (override) return override;
@@ -267,7 +261,6 @@ function getBrandForProduct(storeId, p) {
   if (!brandVal && p?.vendor) brandVal = getLocalized(p.vendor);
   if (!brandVal && p?.manufacturer) brandVal = getLocalized(p.manufacturer);
 
-  // A veces viene como "attributes" o "properties"
   if (!brandVal && p?.attributes && typeof p.attributes === 'object') {
     const possible = p.attributes.brand || p.attributes.marca;
     if (possible) brandVal = getLocalized(possible);
@@ -364,7 +357,7 @@ function parseCookies(cookieHeader) {
 }
 
 /* =========================
-   Landing + Dashboard (igual que antes)
+   Landing + Dashboard
    ========================= */
 app.get('/', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
@@ -472,9 +465,17 @@ app.get('/dashboard', async (req, res) => {
 });
 
 /* =========================
-   OAuth callback (FIX CRÍTICO: usar store_id real)
+   OAuth callback (FIX: store_id || user_id || query params)
    ========================= */
 app.get('/install', (_req, res) => res.redirect(getInstallUrl()));
+
+function normalizeStoreIdCandidate(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  // Tiendanube store_id suele ser numérico; igual lo dejamos pasar si no lo es, pero preferimos numérico
+  return s;
+}
 
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
@@ -498,19 +499,32 @@ app.get('/oauth/callback', async (req, res) => {
       return res.status(500).send('Failed to obtain access token');
     }
 
-    // FIX: usar store_id (no user_id)
-    const { access_token, store_id } = data;
+    // ✅ FIX REAL: algunas respuestas traen store_id, otras user_id
+    const access_token = data?.access_token;
+    const storeId =
+      normalizeStoreIdCandidate(data?.store_id) ||
+      normalizeStoreIdCandidate(data?.user_id) ||
+      normalizeStoreIdCandidate(req.query.store_id) ||
+      normalizeStoreIdCandidate(req.query.user_id) ||
+      normalizeStoreIdCandidate(req.query.uid);
 
-    if (!access_token || !store_id) {
-      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', data);
+    if (!access_token || !storeId) {
+      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', {
+        got_access_token: !!access_token,
+        keys: Object.keys(data || {}),
+        data,
+        query: req.query,
+      });
       return res.status(500).send('Invalid token response from Tiendanube');
     }
 
-    const storeId = String(store_id);
     await saveToken(storeId, access_token);
 
     const maxAge = 60 * 60 * 24 * 30; // 30 días
-    res.setHeader('Set-Cookie', `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`);
+    res.setHeader(
+      'Set-Cookie',
+      `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`
+    );
 
     // Registrar webhook app/uninstalled
     try {
@@ -554,6 +568,7 @@ function getMetrics(storeId) {
       feed_cache_hits: 0,
       feed_304: 0,
       feed_errors: 0,
+      feed_401: 0,
       last_error: null,
       last_generated_at: null,
       last_generation_ms: null,
@@ -595,7 +610,6 @@ function toMoney(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = Number(v);
   if (!Number.isFinite(n)) return null;
-  // Google acepta "14999.00 ARS"; Tiendanube suele devolver string ya, pero normalizamos a 2 decimales
   return n.toFixed(2);
 }
 
@@ -604,8 +618,6 @@ function normalizeText(s) {
 }
 
 function chooseImage(p, v) {
-  // Preferir imagen del variant si existiera, sino primera del producto
-  // Tiendanube: a veces variant.image_id apunta a images[].id
   const imgs = Array.isArray(p?.images) ? p.images : [];
   if (v && v.image_id && imgs.length) {
     const hit = imgs.find((im) => String(im.id) === String(v.image_id));
@@ -615,7 +627,53 @@ function chooseImage(p, v) {
   return '';
 }
 
-// Devuelve items ya “aplanados” según modo de variantes
+function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) {
+  const variantId = v?.id != null ? String(v.id) : '';
+  const item_id = variantId ? `${productId}-${variantId}` : productId;
+
+  const variantName = normalizeText(getLocalized(v?.name));
+  const title =
+    variantName && variantName.toLowerCase() !== 'default'
+      ? `${titleBase} - ${variantName}`
+      : titleBase;
+
+  const regular = toMoney(v?.price);
+  const promo = toMoney(v?.promotional_price);
+
+  let price = regular;
+  let sale_price = null;
+
+  if (regular && promo) {
+    const r = Number(regular);
+    const pnum = Number(promo);
+    if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
+      price = regular;
+      sale_price = promo;
+    }
+  }
+
+  let availability = 'out_of_stock';
+  if (!v?.stock_management) {
+    availability = 'in_stock';
+  } else {
+    const st = v?.stock;
+    if (st !== undefined && st !== null && Number(st) > 0) availability = 'in_stock';
+  }
+
+  return {
+    item_id,
+    title,
+    description: descBase,
+    handleSlug,
+    image_link: chooseImage(p, v),
+    price,
+    sale_price,
+    availability,
+    rawProduct: p,
+    rawVariant: v,
+  };
+}
+
 function flattenItems(products) {
   const items = [];
   for (const p of products) {
@@ -642,69 +700,14 @@ function flattenItems(products) {
     }
 
     if (VARIANT_MODE === 'first') {
-      const v = variants[0];
-      items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
+      items.push(buildItemFromVariant(p, variants[0], productId, titleBase, descBase, handleSlug));
     } else {
-      // split: 1 item por variante (recomendado para Merchant)
       for (const v of variants) {
         items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
       }
     }
   }
   return items;
-}
-
-function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) {
-  const variantId = v?.id != null ? String(v.id) : '';
-  const item_id = variantId ? `${productId}-${variantId}` : productId;
-
-  // Título: base + nombre variante (si aporta)
-  const variantName = normalizeText(getLocalized(v?.name));
-  const title = variantName && variantName.toLowerCase() !== 'default'
-    ? `${titleBase} - ${variantName}`
-    : titleBase;
-
-  // Precio regular y promo
-  const regular = toMoney(v?.price);
-  const promo = toMoney(v?.promotional_price);
-
-  let price = regular;
-  let sale_price = null;
-
-  if (regular && promo) {
-    // si promo < regular => sale_price
-    const r = Number(regular);
-    const pnum = Number(promo);
-    if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
-      price = regular;
-      sale_price = promo;
-    } else {
-      // si promo no es menor, ignoramos sale_price
-      sale_price = null;
-    }
-  }
-
-  // Stock / disponibilidad
-  let availability = 'out_of_stock';
-  if (!v?.stock_management) {
-    availability = 'in_stock';
-  } else {
-    const st = v?.stock;
-    if (st !== undefined && st !== null && Number(st) > 0) availability = 'in_stock';
-  }
-
-  return {
-    item_id,
-    title,
-    description: descBase,
-    handleSlug,
-    image_link: chooseImage(p, v),
-    price,
-    sale_price,
-    availability,
-    rawProduct: p,
-    rawVariant: v,
-  };
 }
 
 function buildXmlFeed({ items, storeDomain, storeId }) {
@@ -716,8 +719,6 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
-    // Por seguridad: si no hay price, no emitimos item (Merchant lo suele rechazar)
-    // Si querés incluirlos igual, comentá este if.
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
@@ -730,20 +731,14 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     if (it.image_link) lines.push(`    <g:image_link>${xmlEscape(it.image_link)}</g:image_link>`);
     lines.push(`    <g:availability>${xmlEscape(it.availability)}</g:availability>`);
-
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
-    // ✅ g:sale_price (si corresponde)
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
-
-    // ✅ brand “correcto”: si está vacío, no lo mandamos (evita "Media Naranja" para todos)
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
-
-    // Si en algún momento querés GTIN/MPN reales, esto hay que hacerlo configurable
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
     lines.push('  </item>');
   }
@@ -794,7 +789,22 @@ app.get('/feed.xml', async (req, res) => {
     // 2) Generar
     const t0 = Date.now();
     const storeDomain = await getPublicDomain(req, sid, token);
-    const products = await fetchAllProducts(sid, token);
+
+    let products;
+    try {
+      products = await fetchAllProducts(sid, token);
+    } catch (err) {
+      // ✅ FIX: si el token es inválido, lo borramos y devolvemos 401 para forzar reinstalación
+      if (err && (err.status === 401 || String(err.message || '').includes('401'))) {
+        m.feed_401 += 1;
+        await deleteToken(sid);
+        return res
+          .status(401)
+          .send('Token inválido o vencido. Reinstalá la app en la tienda para regenerar el acceso.');
+      }
+      throw err;
+    }
+
     const flat = flattenItems(products);
 
     const xml = buildXmlFeed({
@@ -812,7 +822,6 @@ app.get('/feed.xml', async (req, res) => {
     m.last_items_count = flat.length;
     m.last_domain = storeDomain;
 
-    // 3) Responder
     const ifNoneMatch = (req.headers['if-none-match'] || '').replace(/"/g, '');
     if (ifNoneMatch && ifNoneMatch === etag) {
       m.feed_304 += 1;
@@ -862,6 +871,11 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
   }
 });
 
+// ✅ extra: Tiendanube a veces manda GDPR webhooks tipo store/redact → no queremos 404
+app.post('/webhook/store-redact', express.json({ limit: '1mb' }), (_req, res) => {
+  return res.status(200).send('OK');
+});
+
 /* =========================
    Debug opcional (sólo si DEBUG=true)
    ========================= */
@@ -905,7 +919,6 @@ if (process.env.DEBUG === 'true') {
   app.get('/debug/metrics', async (req, res) => {
     const store_id = req.query.store_id;
     if (store_id) return res.json(getMetrics(String(store_id)));
-    // lista todas (útil para operar)
     return res.json({ stores: Array.from(storeMetrics.values()) });
   });
 
