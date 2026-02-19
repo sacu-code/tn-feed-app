@@ -137,6 +137,7 @@ const LOGO_URL = process.env.LOGO_URL || 'https://www.sacudigital.com/apps-sacu/
 // Cache feed (in-memory per instancia)
 const FEED_CACHE_TTL_SECONDS = Number(process.env.FEED_CACHE_TTL_SECONDS || '300'); // 5m default
 const VARIANT_MODE = (process.env.VARIANT_MODE || 'split').toLowerCase(); // split | first
+
 // Defaults de marca
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || ''; // fallback global (si no se detecta marca)
 const BRAND_MAP = process.env.BRAND_MAP || ''; // "2307236:Los Locos,6467092:VRX"
@@ -236,6 +237,29 @@ function getLocalized(val) {
 }
 
 /* =========================
+   ✅ Opción A: excluir NO PUBLICADOS
+   ========================= */
+// Tiendanube suele exponer alguno de estos:
+// - published: boolean
+// - visible: boolean
+// - status: "active" | "inactive" | "draft" (según versión)
+function isPublishedProduct(p) {
+  if (!p || typeof p !== 'object') return true;
+
+  if (typeof p.published === 'boolean') return p.published === true;
+  if (typeof p.visible === 'boolean') return p.visible === true;
+
+  if (typeof p.status === 'string') {
+    const st = p.status.toLowerCase().trim();
+    if (st === 'active' || st === 'published') return true;
+    if (st === 'inactive' || st === 'draft' || st === 'unpublished') return false;
+  }
+
+  // Si no viene ninguna señal, NO rompemos: lo consideramos publicable
+  return true;
+}
+
+/* =========================
    Marca: lógica correcta
    ========================= */
 
@@ -248,6 +272,11 @@ function resolveBrandOverride(storeId) {
   return hit.split(':').slice(1).join(':').trim();
 }
 
+// 1) override por tienda (BRAND_MAP)
+// 2) brand del producto (p.brand / p.brand.name / p.brand.es)
+// 3) vendor / manufacturer / attributes relacionados
+// 4) DEFAULT_BRAND (si existe)
+// 5) string vacío (y el tag <g:brand> NO se emite)
 function getBrandForProduct(storeId, p) {
   const override = resolveBrandOverride(storeId);
   if (override) return override;
@@ -357,7 +386,7 @@ function parseCookies(cookieHeader) {
 }
 
 /* =========================
-   Landing + Dashboard
+   Landing + Dashboard (igual que antes)
    ========================= */
 app.get('/', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
@@ -465,17 +494,9 @@ app.get('/dashboard', async (req, res) => {
 });
 
 /* =========================
-   OAuth callback (FIX: store_id || user_id || query params)
+   OAuth callback (FIX CRÍTICO: usar store_id real)
    ========================= */
 app.get('/install', (_req, res) => res.redirect(getInstallUrl()));
-
-function normalizeStoreIdCandidate(v) {
-  if (v === undefined || v === null) return null;
-  const s = String(v).trim();
-  if (!s) return null;
-  // Tiendanube store_id suele ser numérico; igual lo dejamos pasar si no lo es, pero preferimos numérico
-  return s;
-}
 
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
@@ -499,32 +520,19 @@ app.get('/oauth/callback', async (req, res) => {
       return res.status(500).send('Failed to obtain access token');
     }
 
-    // ✅ FIX REAL: algunas respuestas traen store_id, otras user_id
-    const access_token = data?.access_token;
-    const storeId =
-      normalizeStoreIdCandidate(data?.store_id) ||
-      normalizeStoreIdCandidate(data?.user_id) ||
-      normalizeStoreIdCandidate(req.query.store_id) ||
-      normalizeStoreIdCandidate(req.query.user_id) ||
-      normalizeStoreIdCandidate(req.query.uid);
+    // FIX: usar store_id (no user_id)
+    const { access_token, store_id } = data;
 
-    if (!access_token || !storeId) {
-      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', {
-        got_access_token: !!access_token,
-        keys: Object.keys(data || {}),
-        data,
-        query: req.query,
-      });
+    if (!access_token || !store_id) {
+      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', data);
       return res.status(500).send('Invalid token response from Tiendanube');
     }
 
+    const storeId = String(store_id);
     await saveToken(storeId, access_token);
 
     const maxAge = 60 * 60 * 24 * 30; // 30 días
-    res.setHeader(
-      'Set-Cookie',
-      `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`
-    );
+    res.setHeader('Set-Cookie', `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`);
 
     // Registrar webhook app/uninstalled
     try {
@@ -568,13 +576,13 @@ function getMetrics(storeId) {
       feed_cache_hits: 0,
       feed_304: 0,
       feed_errors: 0,
-      feed_401: 0,
       last_error: null,
       last_generated_at: null,
       last_generation_ms: null,
       last_products_count: null,
       last_items_count: null,
       last_domain: null,
+      last_unpublished_excluded: null, // ✅ nuevo
     });
   }
   return storeMetrics.get(sid);
@@ -627,53 +635,7 @@ function chooseImage(p, v) {
   return '';
 }
 
-function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) {
-  const variantId = v?.id != null ? String(v.id) : '';
-  const item_id = variantId ? `${productId}-${variantId}` : productId;
-
-  const variantName = normalizeText(getLocalized(v?.name));
-  const title =
-    variantName && variantName.toLowerCase() !== 'default'
-      ? `${titleBase} - ${variantName}`
-      : titleBase;
-
-  const regular = toMoney(v?.price);
-  const promo = toMoney(v?.promotional_price);
-
-  let price = regular;
-  let sale_price = null;
-
-  if (regular && promo) {
-    const r = Number(regular);
-    const pnum = Number(promo);
-    if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
-      price = regular;
-      sale_price = promo;
-    }
-  }
-
-  let availability = 'out_of_stock';
-  if (!v?.stock_management) {
-    availability = 'in_stock';
-  } else {
-    const st = v?.stock;
-    if (st !== undefined && st !== null && Number(st) > 0) availability = 'in_stock';
-  }
-
-  return {
-    item_id,
-    title,
-    description: descBase,
-    handleSlug,
-    image_link: chooseImage(p, v),
-    price,
-    sale_price,
-    availability,
-    rawProduct: p,
-    rawVariant: v,
-  };
-}
-
+// Devuelve items ya “aplanados” según modo de variantes
 function flattenItems(products) {
   const items = [];
   for (const p of products) {
@@ -700,7 +662,8 @@ function flattenItems(products) {
     }
 
     if (VARIANT_MODE === 'first') {
-      items.push(buildItemFromVariant(p, variants[0], productId, titleBase, descBase, handleSlug));
+      const v = variants[0];
+      items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
     } else {
       for (const v of variants) {
         items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
@@ -708,6 +671,55 @@ function flattenItems(products) {
     }
   }
   return items;
+}
+
+function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) {
+  const variantId = v?.id != null ? String(v.id) : '';
+  const item_id = variantId ? `${productId}-${variantId}` : productId;
+
+  const variantName = normalizeText(getLocalized(v?.name));
+  const title =
+    variantName && variantName.toLowerCase() !== 'default'
+      ? `${titleBase} - ${variantName}`
+      : titleBase;
+
+  const regular = toMoney(v?.price);
+  const promo = toMoney(v?.promotional_price);
+
+  let price = regular;
+  let sale_price = null;
+
+  if (regular && promo) {
+    const r = Number(regular);
+    const pnum = Number(promo);
+    if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
+      price = regular;
+      sale_price = promo;
+    } else {
+      sale_price = null;
+    }
+  }
+
+  let availability = 'out_of_stock';
+  if (!v?.stock_management) {
+    availability = 'in_stock';
+  } else {
+    const st = v?.stock;
+    if (st !== undefined && st !== null && Number(st) > 0) availability = 'in_stock';
+  }
+
+  return {
+    item_id,
+    title,
+    description: descBase,
+    handleSlug,
+    image_link: chooseImage(p, v),
+    price,
+    sale_price,
+    availability,
+    rawProduct: p,
+    rawVariant: v,
+  };
 }
 
 function buildXmlFeed({ items, storeDomain, storeId }) {
@@ -719,6 +731,7 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
+    // Si no hay price, Merchant lo suele rechazar. Por defecto, lo omitimos.
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
@@ -731,14 +744,19 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     if (it.image_link) lines.push(`    <g:image_link>${xmlEscape(it.image_link)}</g:image_link>`);
     lines.push(`    <g:availability>${xmlEscape(it.availability)}</g:availability>`);
+
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
+    // g:sale_price
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
+
+    // brand correcto: si está vacío, no lo mandamos
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
+
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
     lines.push('  </item>');
   }
@@ -790,22 +808,13 @@ app.get('/feed.xml', async (req, res) => {
     const t0 = Date.now();
     const storeDomain = await getPublicDomain(req, sid, token);
 
-    let products;
-    try {
-      products = await fetchAllProducts(sid, token);
-    } catch (err) {
-      // ✅ FIX: si el token es inválido, lo borramos y devolvemos 401 para forzar reinstalación
-      if (err && (err.status === 401 || String(err.message || '').includes('401'))) {
-        m.feed_401 += 1;
-        await deleteToken(sid);
-        return res
-          .status(401)
-          .send('Token inválido o vencido. Reinstalá la app en la tienda para regenerar el acceso.');
-      }
-      throw err;
-    }
+    const products = await fetchAllProducts(sid, token);
 
-    const flat = flattenItems(products);
+    // ✅ Opción A: excluir NO PUBLICADOS
+    const publishedProducts = products.filter(isPublishedProduct);
+    const excluded = Math.max(0, (products?.length || 0) - publishedProducts.length);
+
+    const flat = flattenItems(publishedProducts);
 
     const xml = buildXmlFeed({
       items: flat,
@@ -818,10 +827,12 @@ app.get('/feed.xml', async (req, res) => {
     const ms = Date.now() - t0;
     m.last_generated_at = new Date().toISOString();
     m.last_generation_ms = ms;
-    m.last_products_count = Array.isArray(products) ? products.length : null;
+    m.last_products_count = Array.isArray(publishedProducts) ? publishedProducts.length : null;
     m.last_items_count = flat.length;
     m.last_domain = storeDomain;
+    m.last_unpublished_excluded = excluded;
 
+    // 3) Responder
     const ifNoneMatch = (req.headers['if-none-match'] || '').replace(/"/g, '');
     if (ifNoneMatch && ifNoneMatch === etag) {
       m.feed_304 += 1;
@@ -871,11 +882,6 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
   }
 });
 
-// ✅ extra: Tiendanube a veces manda GDPR webhooks tipo store/redact → no queremos 404
-app.post('/webhook/store-redact', express.json({ limit: '1mb' }), (_req, res) => {
-  return res.status(200).send('OK');
-});
-
 /* =========================
    Debug opcional (sólo si DEBUG=true)
    ========================= */
@@ -915,14 +921,14 @@ if (process.env.DEBUG === 'true') {
     res.json({ store_id: String(store_id), domain });
   });
 
-  // ✅ Métricas por tienda
+  // Métricas por tienda
   app.get('/debug/metrics', async (req, res) => {
     const store_id = req.query.store_id;
     if (store_id) return res.json(getMetrics(String(store_id)));
     return res.json({ stores: Array.from(storeMetrics.values()) });
   });
 
-  // ✅ Cache status
+  // Cache status
   app.get('/debug/cache', async (req, res) => {
     const store_id = req.query.store_id;
     if (!store_id) {
@@ -954,4 +960,5 @@ if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
 module.exports = app;
+
 
