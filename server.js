@@ -248,12 +248,11 @@ function resolveBrandOverride(storeId) {
   return hit.split(':').slice(1).join(':').trim();
 }
 
-// Heurística de marca por producto/variant:
 // 1) override por tienda (BRAND_MAP)
-// 2) brand del producto (p.brand / p.brand.name / p.brand.es)
-// 3) vendor / manufacturer / attributes relacionados
-// 4) DEFAULT_BRAND (si existe)
-// 5) string vacío (y el tag <g:brand> NO se emite)
+// 2) brand del producto
+// 3) vendor/manufacturer/attributes
+// 4) DEFAULT_BRAND
+// 5) vacío => NO emitir tag
 function getBrandForProduct(storeId, p) {
   const override = resolveBrandOverride(storeId);
   if (override) return override;
@@ -267,14 +266,12 @@ function getBrandForProduct(storeId, p) {
   if (!brandVal && p?.vendor) brandVal = getLocalized(p.vendor);
   if (!brandVal && p?.manufacturer) brandVal = getLocalized(p.manufacturer);
 
-  // A veces viene como "attributes" o "properties"
   if (!brandVal && p?.attributes && typeof p.attributes === 'object') {
     const possible = p.attributes.brand || p.attributes.marca;
     if (possible) brandVal = getLocalized(possible);
   }
 
   brandVal = String(brandVal || '').trim();
-
   if (!brandVal && DEFAULT_BRAND) brandVal = DEFAULT_BRAND.trim();
   return brandVal || '';
 }
@@ -510,7 +507,10 @@ app.get('/oauth/callback', async (req, res) => {
     await saveToken(storeId, access_token);
 
     const maxAge = 60 * 60 * 24 * 30; // 30 días
-    res.setHeader('Set-Cookie', `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`);
+    res.setHeader(
+      'Set-Cookie',
+      `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`
+    );
 
     // Registrar webhook app/uninstalled
     try {
@@ -540,7 +540,7 @@ app.get('/oauth/callback', async (req, res) => {
 });
 
 /* =========================
-   Feed: soporte multi-variant + sale_price + cache + métricas
+   Feed: multi-variant + sale_price + cache + métricas
    ========================= */
 
 // Métricas por tienda (en memoria)
@@ -560,7 +560,7 @@ function getMetrics(storeId) {
       last_products_count: null,
       last_items_count: null,
       last_domain: null,
-      last_unpublished_excluded: 0,
+      last_unpublished_excluded: null,
     });
   }
   return storeMetrics.get(sid);
@@ -613,7 +613,7 @@ function chooseImage(p, v) {
   return '';
 }
 
-// Devuelve items “aplanados” según modo de variantes
+// Devuelve items ya “aplanados” según modo de variantes
 function flattenItems(products) {
   const items = [];
   for (const p of products) {
@@ -643,6 +643,7 @@ function flattenItems(products) {
       const v = variants[0];
       items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
     } else {
+      // split: 1 item por variante (recomendado para Merchant)
       for (const v of variants) {
         items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
       }
@@ -657,7 +658,9 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
 
   const variantName = normalizeText(getLocalized(v?.name));
   const title =
-    variantName && variantName.toLowerCase() !== 'default' ? `${titleBase} - ${variantName}` : titleBase;
+    variantName && variantName.toLowerCase() !== 'default'
+      ? `${titleBase} - ${variantName}`
+      : titleBase;
 
   const regular = toMoney(v?.price);
   const promo = toMoney(v?.promotional_price);
@@ -707,7 +710,7 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
-    // Si no hay price, no emitimos item (Merchant suele rechazarlo)
+    // Si no hay price, no emitimos item (Merchant lo rechaza)
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
@@ -723,14 +726,14 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
-    // g:sale_price (si corresponde)
+    // ✅ g:sale_price (si corresponde)
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
 
-    // brand: si está vacío, no se emite
+    // ✅ brand: si está vacío, no lo mandamos
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
 
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
@@ -784,10 +787,6 @@ app.get('/feed.xml', async (req, res) => {
     const t0 = Date.now();
     const storeDomain = await getPublicDomain(req, sid, token);
     const products = await fetchAllProducts(sid, token);
-
-    // ⚠️ Si tenés lógica de ocultos/no publicados, debería estar acá.
-    // En tu implementación actual ya lo resolviste; NO lo toco.
-
     const flat = flattenItems(products);
 
     const xml = buildXmlFeed({
@@ -856,7 +855,7 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
 });
 
 /* =========================
-   Debug opcional (sólo si DEBUG=true)
+   DEBUG (solo si DEBUG=true)
    ========================= */
 if (process.env.DEBUG === 'true') {
   app.get('/health/db', async (_req, res) => {
@@ -924,60 +923,98 @@ if (process.env.DEBUG === 'true') {
     });
   });
 
-  /* =========================================================
-     ✅ FIX: DEBUG PRODUCT paginado (NO se queda en los 200)
-     URL: /debug/product?store_id=...&handle=...
-     ========================================================= */
-  app.get('/debug/product', async (req, res) => {
-    const { store_id, handle } = req.query;
+  /* ======================================
+     ✅ DEBUG: ver qué devuelve Tiendanube
+     ====================================== */
 
-    if (!store_id || !handle) {
-      return res.status(400).json({ error: 'missing store_id or handle' });
+  // Busca un producto por handle recorriendo páginas (evita "solo first 200")
+  async function findProductByHandle(storeId, token, handle) {
+    const per_page = 200;
+    const maxPages = Number(process.env.DEBUG_PRODUCT_MAX_PAGES || '30'); // 30*200 = 6000 productos
+    const target = String(handle || '').trim();
+
+    for (let page = 1; page <= maxPages; page++) {
+      const data = await tnFetch(storeId, token, `/products?page=${page}&per_page=${per_page}`);
+      if (!Array.isArray(data) || data.length === 0) break;
+
+      const hit = data.find((p) => String(getLocalized(p?.handle)).trim() === target);
+      if (hit) return hit;
+
+      if (data.length < per_page) break;
     }
+    return null;
+  }
 
-    const token = await getToken(String(store_id));
-    if (!token) return res.status(401).json({ error: 'no token' });
-
+  // 1) JSON crudo del producto (para inspección)
+  app.get('/debug/tn-product-raw', async (req, res) => {
     try {
-      let page = 1;
-      const per_page = 200;
-
-      while (true) {
-        const products = await tnFetch(
-          String(store_id),
-          token,
-          `/products?page=${page}&per_page=${per_page}`
-        );
-
-        if (!Array.isArray(products) || products.length === 0) break;
-
-        const found = products.find((p) => String(p?.handle) === String(handle));
-
-        if (found) {
-          const v0 = Array.isArray(found.variants) ? found.variants[0] : null;
-          return res.json({
-            store_id: String(store_id),
-            handle: String(handle),
-            found_on_page: page,
-            variant0_price: v0?.price ?? null,
-            variant0_promotional_price: v0?.promotional_price ?? null,
-            published: found?.published ?? null,
-            visible: found?.visible ?? null,
-            raw: found,
-          });
-        }
-
-        if (products.length < per_page) break;
-        page += 1;
+      const store_id = req.query.store_id;
+      const handle = req.query.handle;
+      if (!store_id || !handle) {
+        return res.status(400).json({ error: 'missing store_id or handle' });
       }
 
-      return res.status(404).json({
-        error: 'product not found in catalog',
-        store_id: String(store_id),
-        handle: String(handle),
-      });
-    } catch (err) {
-      return res.status(500).json({ error: err.message });
+      const sid = String(store_id);
+      const token = await getToken(sid);
+      if (!token) return res.status(401).json({ error: 'no token' });
+
+      const product = await findProductByHandle(sid, token, handle);
+      if (!product) {
+        return res.status(404).json({
+          error: 'product not found in catalog',
+          store_id: sid,
+          handle: String(handle),
+          tip:
+            'Aumentá DEBUG_PRODUCT_MAX_PAGES si la tienda tiene catálogo enorme (default 30 páginas).',
+        });
+      }
+
+      return res.json(product);
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
+    }
+  });
+
+  // 2) SOLO los campos que te interesan (id/handle/variants)
+  app.get('/debug/variant-fields', async (req, res) => {
+    try {
+      const store_id = req.query.store_id;
+      const handle = req.query.handle;
+      if (!store_id || !handle) {
+        return res.status(400).json({ error: 'missing store_id or handle' });
+      }
+
+      const sid = String(store_id);
+      const token = await getToken(sid);
+      if (!token) return res.status(401).json({ error: 'no token' });
+
+      const product = await findProductByHandle(sid, token, handle);
+      if (!product) {
+        return res.status(404).json({
+          error: 'product not found in catalog',
+          store_id: sid,
+          handle: String(handle),
+        });
+      }
+
+      const out = {
+        id: product?.id ?? null,
+        handle: getLocalized(product?.handle),
+        name: getLocalized(product?.name),
+        variants: Array.isArray(product?.variants)
+          ? product.variants.map((v) => ({
+              id: v?.id ?? null,
+              price: v?.price ?? null,
+              promotional_price: v?.promotional_price ?? null,
+              stock: v?.stock ?? null,
+              stock_management: v?.stock_management ?? null,
+            }))
+          : [],
+      };
+
+      return res.json(out);
+    } catch (e) {
+      return res.status(500).json({ error: e.message });
     }
   });
 }
