@@ -137,10 +137,12 @@ const LOGO_URL = process.env.LOGO_URL || 'https://www.sacudigital.com/apps-sacu/
 // Cache feed (in-memory per instancia)
 const FEED_CACHE_TTL_SECONDS = Number(process.env.FEED_CACHE_TTL_SECONDS || '300'); // 5m default
 const VARIANT_MODE = (process.env.VARIANT_MODE || 'split').toLowerCase(); // split | first
-
 // Defaults de marca
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || ''; // fallback global (si no se detecta marca)
 const BRAND_MAP = process.env.BRAND_MAP || ''; // "2307236:Los Locos,6467092:VRX"
+
+// PUBLICACIÓN / VISIBILIDAD (lo que ya resolvimos)
+const EXCLUDE_UNPUBLISHED = (process.env.EXCLUDE_UNPUBLISHED || 'true').toLowerCase() === 'true';
 
 /* =========================
    Helpers Tiendanube
@@ -234,29 +236,6 @@ function getLocalized(val) {
     return keys.length > 0 ? val[keys[0]] : '';
   }
   return String(val);
-}
-
-/* =========================
-   ✅ Opción A: excluir NO PUBLICADOS
-   ========================= */
-// Tiendanube suele exponer alguno de estos:
-// - published: boolean
-// - visible: boolean
-// - status: "active" | "inactive" | "draft" (según versión)
-function isPublishedProduct(p) {
-  if (!p || typeof p !== 'object') return true;
-
-  if (typeof p.published === 'boolean') return p.published === true;
-  if (typeof p.visible === 'boolean') return p.visible === true;
-
-  if (typeof p.status === 'string') {
-    const st = p.status.toLowerCase().trim();
-    if (st === 'active' || st === 'published') return true;
-    if (st === 'inactive' || st === 'draft' || st === 'unpublished') return false;
-  }
-
-  // Si no viene ninguna señal, NO rompemos: lo consideramos publicable
-  return true;
 }
 
 /* =========================
@@ -386,7 +365,7 @@ function parseCookies(cookieHeader) {
 }
 
 /* =========================
-   Landing + Dashboard (igual que antes)
+   Landing + Dashboard
    ========================= */
 app.get('/', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
@@ -563,6 +542,7 @@ app.get('/oauth/callback', async (req, res) => {
 
 /* =========================
    Feed: soporte multi-variant + sale_price + cache + métricas
+   + ocultos/no publicados (EXCLUDE_UNPUBLISHED)
    ========================= */
 
 // Métricas por tienda (en memoria)
@@ -582,7 +562,7 @@ function getMetrics(storeId) {
       last_products_count: null,
       last_items_count: null,
       last_domain: null,
-      last_unpublished_excluded: null, // ✅ nuevo
+      last_unpublished_excluded: 0,
     });
   }
   return storeMetrics.get(sid);
@@ -635,10 +615,32 @@ function chooseImage(p, v) {
   return '';
 }
 
+// Determinar si un producto está publicado/visible (lo más robusto posible)
+function isProductPublished(p) {
+  // Casos típicos en TN: published boolean, visible boolean, status string
+  if (typeof p?.published === 'boolean') return p.published;
+  if (typeof p?.visible === 'boolean') return p.visible;
+  if (typeof p?.status === 'string') {
+    const s = p.status.toLowerCase();
+    // “active” / “inactive” / “draft” / “disabled”
+    if (['active', 'enabled', 'published'].includes(s)) return true;
+    if (['inactive', 'disabled', 'draft', 'unpublished'].includes(s)) return false;
+  }
+  // Si no hay campo, asumimos publicado (para no “romper” feeds)
+  return true;
+}
+
 // Devuelve items ya “aplanados” según modo de variantes
-function flattenItems(products) {
+function flattenItems(products, metrics) {
   const items = [];
+  let unpublishedExcluded = 0;
+
   for (const p of products) {
+    if (EXCLUDE_UNPUBLISHED && !isProductPublished(p)) {
+      unpublishedExcluded += 1;
+      continue;
+    }
+
     const productId = p?.id != null ? String(p.id) : normalizeText(getLocalized(p?.handle));
     const titleBase = normalizeText(getLocalized(p?.name));
     const descBase = normalizeText(getLocalized(p?.description)) || titleBase;
@@ -670,6 +672,8 @@ function flattenItems(products) {
       }
     }
   }
+
+  if (metrics) metrics.last_unpublished_excluded = unpublishedExcluded;
   return items;
 }
 
@@ -679,9 +683,7 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
 
   const variantName = normalizeText(getLocalized(v?.name));
   const title =
-    variantName && variantName.toLowerCase() !== 'default'
-      ? `${titleBase} - ${variantName}`
-      : titleBase;
+    variantName && variantName.toLowerCase() !== 'default' ? `${titleBase} - ${variantName}` : titleBase;
 
   const regular = toMoney(v?.price);
   const promo = toMoney(v?.promotional_price);
@@ -731,7 +733,7 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
-    // Si no hay price, Merchant lo suele rechazar. Por defecto, lo omitimos.
+    // Si no hay price, Merchant suele rechazar: lo omitimos
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
@@ -747,14 +749,14 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
-    // g:sale_price
+    // ✅ sale_price
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
 
-    // brand correcto: si está vacío, no lo mandamos
+    // ✅ brand: si está vacío, no lo mandamos
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
 
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
@@ -807,14 +809,8 @@ app.get('/feed.xml', async (req, res) => {
     // 2) Generar
     const t0 = Date.now();
     const storeDomain = await getPublicDomain(req, sid, token);
-
     const products = await fetchAllProducts(sid, token);
-
-    // ✅ Opción A: excluir NO PUBLICADOS
-    const publishedProducts = products.filter(isPublishedProduct);
-    const excluded = Math.max(0, (products?.length || 0) - publishedProducts.length);
-
-    const flat = flattenItems(publishedProducts);
+    const flat = flattenItems(products, m);
 
     const xml = buildXmlFeed({
       items: flat,
@@ -827,10 +823,9 @@ app.get('/feed.xml', async (req, res) => {
     const ms = Date.now() - t0;
     m.last_generated_at = new Date().toISOString();
     m.last_generation_ms = ms;
-    m.last_products_count = Array.isArray(publishedProducts) ? publishedProducts.length : null;
+    m.last_products_count = Array.isArray(products) ? products.length : null;
     m.last_items_count = flat.length;
     m.last_domain = storeDomain;
-    m.last_unpublished_excluded = excluded;
 
     // 3) Responder
     const ifNoneMatch = (req.headers['if-none-match'] || '').replace(/"/g, '');
@@ -921,14 +916,14 @@ if (process.env.DEBUG === 'true') {
     res.json({ store_id: String(store_id), domain });
   });
 
-  // Métricas por tienda
+  // ✅ Métricas por tienda
   app.get('/debug/metrics', async (req, res) => {
     const store_id = req.query.store_id;
     if (store_id) return res.json(getMetrics(String(store_id)));
     return res.json({ stores: Array.from(storeMetrics.values()) });
   });
 
-  // Cache status
+  // ✅ Cache status
   app.get('/debug/cache', async (req, res) => {
     const store_id = req.query.store_id;
     if (!store_id) {
@@ -950,6 +945,63 @@ if (process.env.DEBUG === 'true') {
       expires_in_ms: Math.max(0, c.expiresAt - Date.now()),
     });
   });
+
+  // ✅ Debug: ver precios reales que devuelve la API (price / promotional_price) por handle
+  app.get('/debug/product', async (req, res) => {
+    try {
+      const store_id = req.query.store_id;
+      const handle = req.query.handle;
+
+      if (!store_id) return res.status(400).json({ error: 'missing store_id' });
+      if (!handle) return res.status(400).json({ error: 'missing handle' });
+
+      const sid = String(store_id);
+      const token = await getToken(sid);
+      if (!token) return res.status(401).json({ error: 'no token' });
+
+      // Traemos page=1 y filtramos por handle (rápido). Si no aparece, se puede hacer paginado.
+      const products = await tnFetch(sid, token, `/products?page=1&per_page=200`);
+      const p = Array.isArray(products)
+        ? products.find((x) => String(x?.handle) === String(handle))
+        : null;
+
+      if (!p) {
+        return res.status(404).json({
+          error: 'product not found in first 200 products',
+          tip: 'si la tienda tiene mucho catálogo, este debug trae sólo page=1. Te paso el paginado si lo necesitás.',
+          store_id: sid,
+          handle,
+        });
+      }
+
+      const variants = Array.isArray(p.variants) ? p.variants : [];
+
+      const out = {
+        store_id: sid,
+        product: {
+          id: p.id,
+          handle: p.handle,
+          name: getLocalized(p.name),
+          published: p.published ?? p.visible ?? p.status ?? null,
+          brand: p.brand ?? null,
+        },
+        variants: variants.map((v) => ({
+          id: v.id,
+          name: getLocalized(v.name),
+          price: v.price ?? null,
+          promotional_price: v.promotional_price ?? null,
+          stock_management: v.stock_management ?? null,
+          stock: v.stock ?? null,
+          sku: v.sku ?? null,
+        })),
+      };
+
+      return res.json(out);
+    } catch (e) {
+      console.error('[DebugProduct] error:', e);
+      return res.status(500).json({ error: e.message || String(e) });
+    }
+  });
 }
 
 /* =========================
@@ -960,5 +1012,3 @@ if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
 module.exports = app;
-
-
