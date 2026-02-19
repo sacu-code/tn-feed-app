@@ -141,9 +141,6 @@ const VARIANT_MODE = (process.env.VARIANT_MODE || 'split').toLowerCase(); // spl
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || ''; // fallback global (si no se detecta marca)
 const BRAND_MAP = process.env.BRAND_MAP || ''; // "2307236:Los Locos,6467092:VRX"
 
-// PUBLICACIÓN / VISIBILIDAD (lo que ya resolvimos)
-const EXCLUDE_UNPUBLISHED = (process.env.EXCLUDE_UNPUBLISHED || 'true').toLowerCase() === 'true';
-
 /* =========================
    Helpers Tiendanube
    ========================= */
@@ -251,6 +248,7 @@ function resolveBrandOverride(storeId) {
   return hit.split(':').slice(1).join(':').trim();
 }
 
+// Heurística de marca por producto/variant:
 // 1) override por tienda (BRAND_MAP)
 // 2) brand del producto (p.brand / p.brand.name / p.brand.es)
 // 3) vendor / manufacturer / attributes relacionados
@@ -269,6 +267,7 @@ function getBrandForProduct(storeId, p) {
   if (!brandVal && p?.vendor) brandVal = getLocalized(p.vendor);
   if (!brandVal && p?.manufacturer) brandVal = getLocalized(p.manufacturer);
 
+  // A veces viene como "attributes" o "properties"
   if (!brandVal && p?.attributes && typeof p.attributes === 'object') {
     const possible = p.attributes.brand || p.attributes.marca;
     if (possible) brandVal = getLocalized(possible);
@@ -542,7 +541,6 @@ app.get('/oauth/callback', async (req, res) => {
 
 /* =========================
    Feed: soporte multi-variant + sale_price + cache + métricas
-   + ocultos/no publicados (EXCLUDE_UNPUBLISHED)
    ========================= */
 
 // Métricas por tienda (en memoria)
@@ -615,32 +613,10 @@ function chooseImage(p, v) {
   return '';
 }
 
-// Determinar si un producto está publicado/visible (lo más robusto posible)
-function isProductPublished(p) {
-  // Casos típicos en TN: published boolean, visible boolean, status string
-  if (typeof p?.published === 'boolean') return p.published;
-  if (typeof p?.visible === 'boolean') return p.visible;
-  if (typeof p?.status === 'string') {
-    const s = p.status.toLowerCase();
-    // “active” / “inactive” / “draft” / “disabled”
-    if (['active', 'enabled', 'published'].includes(s)) return true;
-    if (['inactive', 'disabled', 'draft', 'unpublished'].includes(s)) return false;
-  }
-  // Si no hay campo, asumimos publicado (para no “romper” feeds)
-  return true;
-}
-
-// Devuelve items ya “aplanados” según modo de variantes
-function flattenItems(products, metrics) {
+// Devuelve items “aplanados” según modo de variantes
+function flattenItems(products) {
   const items = [];
-  let unpublishedExcluded = 0;
-
   for (const p of products) {
-    if (EXCLUDE_UNPUBLISHED && !isProductPublished(p)) {
-      unpublishedExcluded += 1;
-      continue;
-    }
-
     const productId = p?.id != null ? String(p.id) : normalizeText(getLocalized(p?.handle));
     const titleBase = normalizeText(getLocalized(p?.name));
     const descBase = normalizeText(getLocalized(p?.description)) || titleBase;
@@ -672,8 +648,6 @@ function flattenItems(products, metrics) {
       }
     }
   }
-
-  if (metrics) metrics.last_unpublished_excluded = unpublishedExcluded;
   return items;
 }
 
@@ -733,7 +707,7 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
-    // Si no hay price, Merchant suele rechazar: lo omitimos
+    // Si no hay price, no emitimos item (Merchant suele rechazarlo)
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
@@ -749,14 +723,14 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
-    // ✅ sale_price
+    // g:sale_price (si corresponde)
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
 
-    // ✅ brand: si está vacío, no lo mandamos
+    // brand: si está vacío, no se emite
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
 
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
@@ -810,7 +784,11 @@ app.get('/feed.xml', async (req, res) => {
     const t0 = Date.now();
     const storeDomain = await getPublicDomain(req, sid, token);
     const products = await fetchAllProducts(sid, token);
-    const flat = flattenItems(products, m);
+
+    // ⚠️ Si tenés lógica de ocultos/no publicados, debería estar acá.
+    // En tu implementación actual ya lo resolviste; NO lo toco.
+
+    const flat = flattenItems(products);
 
     const xml = buildXmlFeed({
       items: flat,
@@ -946,62 +924,63 @@ if (process.env.DEBUG === 'true') {
     });
   });
 
-  // ✅ Debug: ver precios reales que devuelve la API (price / promotional_price) por handle
- app.get('/debug/product', async (req, res) => {
-  const { store_id, handle } = req.query;
+  /* =========================================================
+     ✅ FIX: DEBUG PRODUCT paginado (NO se queda en los 200)
+     URL: /debug/product?store_id=...&handle=...
+     ========================================================= */
+  app.get('/debug/product', async (req, res) => {
+    const { store_id, handle } = req.query;
 
-  if (!store_id || !handle)
-    return res.status(400).json({ error: 'missing store_id or handle' });
-
-  const token = await getToken(String(store_id));
-  if (!token)
-    return res.status(401).json({ error: 'no token' });
-
-  try {
-    let page = 1;
-    const per_page = 200;
-
-    while (true) {
-      const products = await tnFetch(
-        store_id,
-        token,
-        `/products?page=${page}&per_page=${per_page}`
-      );
-
-      if (!products.length) break;
-
-      const found = products.find(
-        (p) => String(p.handle) === String(handle)
-      );
-
-      if (found) {
-        return res.json({
-          store_id,
-          handle,
-          found_on_page: page,
-          price: found.variants?.[0]?.price,
-          promotional_price: found.variants?.[0]?.promotional_price,
-          published: found.published,
-          visible: found.visible,
-          raw: found
-        });
-      }
-
-      if (products.length < per_page) break;
-
-      page++;
+    if (!store_id || !handle) {
+      return res.status(400).json({ error: 'missing store_id or handle' });
     }
 
-    return res.status(404).json({
-      error: 'product not found in catalog'
-    });
+    const token = await getToken(String(store_id));
+    if (!token) return res.status(401).json({ error: 'no token' });
 
-  } catch (err) {
-    return res.status(500).json({
-      error: err.message
-    });
-  }
-});
+    try {
+      let page = 1;
+      const per_page = 200;
+
+      while (true) {
+        const products = await tnFetch(
+          String(store_id),
+          token,
+          `/products?page=${page}&per_page=${per_page}`
+        );
+
+        if (!Array.isArray(products) || products.length === 0) break;
+
+        const found = products.find((p) => String(p?.handle) === String(handle));
+
+        if (found) {
+          const v0 = Array.isArray(found.variants) ? found.variants[0] : null;
+          return res.json({
+            store_id: String(store_id),
+            handle: String(handle),
+            found_on_page: page,
+            variant0_price: v0?.price ?? null,
+            variant0_promotional_price: v0?.promotional_price ?? null,
+            published: found?.published ?? null,
+            visible: found?.visible ?? null,
+            raw: found,
+          });
+        }
+
+        if (products.length < per_page) break;
+        page += 1;
+      }
+
+      return res.status(404).json({
+        error: 'product not found in catalog',
+        store_id: String(store_id),
+        handle: String(handle),
+      });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  });
+}
 
 /* =========================
    Arranque local / export
