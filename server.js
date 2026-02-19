@@ -947,62 +947,61 @@ if (process.env.DEBUG === 'true') {
   });
 
   // ✅ Debug: ver precios reales que devuelve la API (price / promotional_price) por handle
-  app.get('/debug/product', async (req, res) => {
-    try {
-      const store_id = req.query.store_id;
-      const handle = req.query.handle;
+ app.get('/debug/product', async (req, res) => {
+  const { store_id, handle } = req.query;
 
-      if (!store_id) return res.status(400).json({ error: 'missing store_id' });
-      if (!handle) return res.status(400).json({ error: 'missing handle' });
+  if (!store_id || !handle)
+    return res.status(400).json({ error: 'missing store_id or handle' });
 
-      const sid = String(store_id);
-      const token = await getToken(sid);
-      if (!token) return res.status(401).json({ error: 'no token' });
+  const token = await getToken(String(store_id));
+  if (!token)
+    return res.status(401).json({ error: 'no token' });
 
-      // Traemos page=1 y filtramos por handle (rápido). Si no aparece, se puede hacer paginado.
-      const products = await tnFetch(sid, token, `/products?page=1&per_page=200`);
-      const p = Array.isArray(products)
-        ? products.find((x) => String(x?.handle) === String(handle))
-        : null;
+  try {
+    let page = 1;
+    const per_page = 200;
 
-      if (!p) {
-        return res.status(404).json({
-          error: 'product not found in first 200 products',
-          tip: 'si la tienda tiene mucho catálogo, este debug trae sólo page=1. Te paso el paginado si lo necesitás.',
-          store_id: sid,
+    while (true) {
+      const products = await tnFetch(
+        store_id,
+        token,
+        `/products?page=${page}&per_page=${per_page}`
+      );
+
+      if (!products.length) break;
+
+      const found = products.find(
+        (p) => String(p.handle) === String(handle)
+      );
+
+      if (found) {
+        return res.json({
+          store_id,
           handle,
+          found_on_page: page,
+          price: found.variants?.[0]?.price,
+          promotional_price: found.variants?.[0]?.promotional_price,
+          published: found.published,
+          visible: found.visible,
+          raw: found
         });
       }
 
-      const variants = Array.isArray(p.variants) ? p.variants : [];
+      if (products.length < per_page) break;
 
-      const out = {
-        store_id: sid,
-        product: {
-          id: p.id,
-          handle: p.handle,
-          name: getLocalized(p.name),
-          published: p.published ?? p.visible ?? p.status ?? null,
-          brand: p.brand ?? null,
-        },
-        variants: variants.map((v) => ({
-          id: v.id,
-          name: getLocalized(v.name),
-          price: v.price ?? null,
-          promotional_price: v.promotional_price ?? null,
-          stock_management: v.stock_management ?? null,
-          stock: v.stock ?? null,
-          sku: v.sku ?? null,
-        })),
-      };
-
-      return res.json(out);
-    } catch (e) {
-      console.error('[DebugProduct] error:', e);
-      return res.status(500).json({ error: e.message || String(e) });
+      page++;
     }
-  });
-}
+
+    return res.status(404).json({
+      error: 'product not found in catalog'
+    });
+
+  } catch (err) {
+    return res.status(500).json({
+      error: err.message
+    });
+  }
+});
 
 /* =========================
    Arranque local / export
