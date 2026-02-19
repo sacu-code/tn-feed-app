@@ -141,9 +141,6 @@ const VARIANT_MODE = (process.env.VARIANT_MODE || 'split').toLowerCase(); // spl
 const DEFAULT_BRAND = process.env.DEFAULT_BRAND || ''; // fallback global (si no se detecta marca)
 const BRAND_MAP = process.env.BRAND_MAP || ''; // "2307236:Los Locos,6467092:VRX"
 
-// PUBLICACIÓN / VISIBILIDAD (lo que ya resolvimos)
-const EXCLUDE_UNPUBLISHED = (process.env.EXCLUDE_UNPUBLISHED || 'true').toLowerCase() === 'true';
-
 /* =========================
    Helpers Tiendanube
    ========================= */
@@ -251,11 +248,6 @@ function resolveBrandOverride(storeId) {
   return hit.split(':').slice(1).join(':').trim();
 }
 
-// 1) override por tienda (BRAND_MAP)
-// 2) brand del producto (p.brand / p.brand.name / p.brand.es)
-// 3) vendor / manufacturer / attributes relacionados
-// 4) DEFAULT_BRAND (si existe)
-// 5) string vacío (y el tag <g:brand> NO se emite)
 function getBrandForProduct(storeId, p) {
   const override = resolveBrandOverride(storeId);
   if (override) return override;
@@ -473,9 +465,17 @@ app.get('/dashboard', async (req, res) => {
 });
 
 /* =========================
-   OAuth callback (FIX CRÍTICO: usar store_id real)
+   OAuth callback (FIX: store_id || user_id || query params)
    ========================= */
 app.get('/install', (_req, res) => res.redirect(getInstallUrl()));
+
+function normalizeStoreIdCandidate(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  // Tiendanube store_id suele ser numérico; igual lo dejamos pasar si no lo es, pero preferimos numérico
+  return s;
+}
 
 app.get('/oauth/callback', async (req, res) => {
   const { code } = req.query;
@@ -499,19 +499,32 @@ app.get('/oauth/callback', async (req, res) => {
       return res.status(500).send('Failed to obtain access token');
     }
 
-    // FIX: usar store_id (no user_id)
-    const { access_token, store_id } = data;
+    // ✅ FIX REAL: algunas respuestas traen store_id, otras user_id
+    const access_token = data?.access_token;
+    const storeId =
+      normalizeStoreIdCandidate(data?.store_id) ||
+      normalizeStoreIdCandidate(data?.user_id) ||
+      normalizeStoreIdCandidate(req.query.store_id) ||
+      normalizeStoreIdCandidate(req.query.user_id) ||
+      normalizeStoreIdCandidate(req.query.uid);
 
-    if (!access_token || !store_id) {
-      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', data);
+    if (!access_token || !storeId) {
+      console.error('[OAuth] Respuesta inválida (missing access_token/store_id):', {
+        got_access_token: !!access_token,
+        keys: Object.keys(data || {}),
+        data,
+        query: req.query,
+      });
       return res.status(500).send('Invalid token response from Tiendanube');
     }
 
-    const storeId = String(store_id);
     await saveToken(storeId, access_token);
 
     const maxAge = 60 * 60 * 24 * 30; // 30 días
-    res.setHeader('Set-Cookie', `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`);
+    res.setHeader(
+      'Set-Cookie',
+      `store_id=${storeId}; Path=/; Max-Age=${maxAge}; SameSite=None; Secure`
+    );
 
     // Registrar webhook app/uninstalled
     try {
@@ -542,7 +555,6 @@ app.get('/oauth/callback', async (req, res) => {
 
 /* =========================
    Feed: soporte multi-variant + sale_price + cache + métricas
-   + ocultos/no publicados (EXCLUDE_UNPUBLISHED)
    ========================= */
 
 // Métricas por tienda (en memoria)
@@ -556,13 +568,13 @@ function getMetrics(storeId) {
       feed_cache_hits: 0,
       feed_304: 0,
       feed_errors: 0,
+      feed_401: 0,
       last_error: null,
       last_generated_at: null,
       last_generation_ms: null,
       last_products_count: null,
       last_items_count: null,
       last_domain: null,
-      last_unpublished_excluded: 0,
     });
   }
   return storeMetrics.get(sid);
@@ -615,75 +627,15 @@ function chooseImage(p, v) {
   return '';
 }
 
-// Determinar si un producto está publicado/visible (lo más robusto posible)
-function isProductPublished(p) {
-  // Casos típicos en TN: published boolean, visible boolean, status string
-  if (typeof p?.published === 'boolean') return p.published;
-  if (typeof p?.visible === 'boolean') return p.visible;
-  if (typeof p?.status === 'string') {
-    const s = p.status.toLowerCase();
-    // “active” / “inactive” / “draft” / “disabled”
-    if (['active', 'enabled', 'published'].includes(s)) return true;
-    if (['inactive', 'disabled', 'draft', 'unpublished'].includes(s)) return false;
-  }
-  // Si no hay campo, asumimos publicado (para no “romper” feeds)
-  return true;
-}
-
-// Devuelve items ya “aplanados” según modo de variantes
-function flattenItems(products, metrics) {
-  const items = [];
-  let unpublishedExcluded = 0;
-
-  for (const p of products) {
-    if (EXCLUDE_UNPUBLISHED && !isProductPublished(p)) {
-      unpublishedExcluded += 1;
-      continue;
-    }
-
-    const productId = p?.id != null ? String(p.id) : normalizeText(getLocalized(p?.handle));
-    const titleBase = normalizeText(getLocalized(p?.name));
-    const descBase = normalizeText(getLocalized(p?.description)) || titleBase;
-    const handleSlug = normalizeText(getLocalized(p?.handle)) || productId;
-
-    const variants = Array.isArray(p?.variants) ? p.variants : [];
-    if (!variants.length) {
-      items.push({
-        item_id: productId,
-        title: titleBase,
-        description: descBase,
-        handleSlug,
-        image_link: chooseImage(p, null),
-        price: null,
-        sale_price: null,
-        availability: 'out_of_stock',
-        rawProduct: p,
-        rawVariant: null,
-      });
-      continue;
-    }
-
-    if (VARIANT_MODE === 'first') {
-      const v = variants[0];
-      items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
-    } else {
-      for (const v of variants) {
-        items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
-      }
-    }
-  }
-
-  if (metrics) metrics.last_unpublished_excluded = unpublishedExcluded;
-  return items;
-}
-
 function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) {
   const variantId = v?.id != null ? String(v.id) : '';
   const item_id = variantId ? `${productId}-${variantId}` : productId;
 
   const variantName = normalizeText(getLocalized(v?.name));
   const title =
-    variantName && variantName.toLowerCase() !== 'default' ? `${titleBase} - ${variantName}` : titleBase;
+    variantName && variantName.toLowerCase() !== 'default'
+      ? `${titleBase} - ${variantName}`
+      : titleBase;
 
   const regular = toMoney(v?.price);
   const promo = toMoney(v?.promotional_price);
@@ -697,8 +649,6 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
     if (Number.isFinite(r) && Number.isFinite(pnum) && pnum > 0 && pnum < r) {
       price = regular;
       sale_price = promo;
-    } else {
-      sale_price = null;
     }
   }
 
@@ -724,6 +674,42 @@ function buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug) 
   };
 }
 
+function flattenItems(products) {
+  const items = [];
+  for (const p of products) {
+    const productId = p?.id != null ? String(p.id) : normalizeText(getLocalized(p?.handle));
+    const titleBase = normalizeText(getLocalized(p?.name));
+    const descBase = normalizeText(getLocalized(p?.description)) || titleBase;
+    const handleSlug = normalizeText(getLocalized(p?.handle)) || productId;
+
+    const variants = Array.isArray(p?.variants) ? p.variants : [];
+    if (!variants.length) {
+      items.push({
+        item_id: productId,
+        title: titleBase,
+        description: descBase,
+        handleSlug,
+        image_link: chooseImage(p, null),
+        price: null,
+        sale_price: null,
+        availability: 'out_of_stock',
+        rawProduct: p,
+        rawVariant: null,
+      });
+      continue;
+    }
+
+    if (VARIANT_MODE === 'first') {
+      items.push(buildItemFromVariant(p, variants[0], productId, titleBase, descBase, handleSlug));
+    } else {
+      for (const v of variants) {
+        items.push(buildItemFromVariant(p, v, productId, titleBase, descBase, handleSlug));
+      }
+    }
+  }
+  return items;
+}
+
 function buildXmlFeed({ items, storeDomain, storeId }) {
   const safeDomain = normalizeDomain(storeDomain) || 'invalid-domain';
   const currency = 'ARS';
@@ -733,7 +719,6 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
     const p = it.rawProduct || {};
     const brandVal = getBrandForProduct(storeId, p);
 
-    // Si no hay price, Merchant suele rechazar: lo omitimos
     if (!it.price) continue;
 
     const link = productLink(safeDomain, it.handleSlug);
@@ -746,19 +731,14 @@ function buildXmlFeed({ items, storeDomain, storeId }) {
 
     if (it.image_link) lines.push(`    <g:image_link>${xmlEscape(it.image_link)}</g:image_link>`);
     lines.push(`    <g:availability>${xmlEscape(it.availability)}</g:availability>`);
-
     lines.push(`    <g:price>${xmlEscape(it.price)} ${currency}</g:price>`);
 
-    // ✅ sale_price
     if (it.sale_price) {
       lines.push(`    <g:sale_price>${xmlEscape(it.sale_price)} ${currency}</g:sale_price>`);
     }
 
     lines.push('    <g:condition>new</g:condition>');
-
-    // ✅ brand: si está vacío, no lo mandamos
     if (brandVal) lines.push(`    <g:brand><![CDATA[${safeCdata(brandVal)}]]></g:brand>`);
-
     lines.push('    <g:identifier_exists>false</g:identifier_exists>');
     lines.push('  </item>');
   }
@@ -809,8 +789,23 @@ app.get('/feed.xml', async (req, res) => {
     // 2) Generar
     const t0 = Date.now();
     const storeDomain = await getPublicDomain(req, sid, token);
-    const products = await fetchAllProducts(sid, token);
-    const flat = flattenItems(products, m);
+
+    let products;
+    try {
+      products = await fetchAllProducts(sid, token);
+    } catch (err) {
+      // ✅ FIX: si el token es inválido, lo borramos y devolvemos 401 para forzar reinstalación
+      if (err && (err.status === 401 || String(err.message || '').includes('401'))) {
+        m.feed_401 += 1;
+        await deleteToken(sid);
+        return res
+          .status(401)
+          .send('Token inválido o vencido. Reinstalá la app en la tienda para regenerar el acceso.');
+      }
+      throw err;
+    }
+
+    const flat = flattenItems(products);
 
     const xml = buildXmlFeed({
       items: flat,
@@ -827,7 +822,6 @@ app.get('/feed.xml', async (req, res) => {
     m.last_items_count = flat.length;
     m.last_domain = storeDomain;
 
-    // 3) Responder
     const ifNoneMatch = (req.headers['if-none-match'] || '').replace(/"/g, '');
     if (ifNoneMatch && ifNoneMatch === etag) {
       m.feed_304 += 1;
@@ -875,6 +869,11 @@ app.post('/webhook', express.json({ limit: '1mb' }), async (req, res) => {
     console.error('[Webhook] Error procesando webhook:', e);
     return res.status(500).send('Error');
   }
+});
+
+// ✅ extra: Tiendanube a veces manda GDPR webhooks tipo store/redact → no queremos 404
+app.post('/webhook/store-redact', express.json({ limit: '1mb' }), (_req, res) => {
+  return res.status(200).send('OK');
 });
 
 /* =========================
@@ -945,63 +944,6 @@ if (process.env.DEBUG === 'true') {
       expires_in_ms: Math.max(0, c.expiresAt - Date.now()),
     });
   });
-
-  // ✅ Debug: ver precios reales que devuelve la API (price / promotional_price) por handle
-  app.get('/debug/product', async (req, res) => {
-    try {
-      const store_id = req.query.store_id;
-      const handle = req.query.handle;
-
-      if (!store_id) return res.status(400).json({ error: 'missing store_id' });
-      if (!handle) return res.status(400).json({ error: 'missing handle' });
-
-      const sid = String(store_id);
-      const token = await getToken(sid);
-      if (!token) return res.status(401).json({ error: 'no token' });
-
-      // Traemos page=1 y filtramos por handle (rápido). Si no aparece, se puede hacer paginado.
-      const products = await tnFetch(sid, token, `/products?page=1&per_page=200`);
-      const p = Array.isArray(products)
-        ? products.find((x) => String(x?.handle) === String(handle))
-        : null;
-
-      if (!p) {
-        return res.status(404).json({
-          error: 'product not found in first 200 products',
-          tip: 'si la tienda tiene mucho catálogo, este debug trae sólo page=1. Te paso el paginado si lo necesitás.',
-          store_id: sid,
-          handle,
-        });
-      }
-
-      const variants = Array.isArray(p.variants) ? p.variants : [];
-
-      const out = {
-        store_id: sid,
-        product: {
-          id: p.id,
-          handle: p.handle,
-          name: getLocalized(p.name),
-          published: p.published ?? p.visible ?? p.status ?? null,
-          brand: p.brand ?? null,
-        },
-        variants: variants.map((v) => ({
-          id: v.id,
-          name: getLocalized(v.name),
-          price: v.price ?? null,
-          promotional_price: v.promotional_price ?? null,
-          stock_management: v.stock_management ?? null,
-          stock: v.stock ?? null,
-          sku: v.sku ?? null,
-        })),
-      };
-
-      return res.json(out);
-    } catch (e) {
-      console.error('[DebugProduct] error:', e);
-      return res.status(500).json({ error: e.message || String(e) });
-    }
-  });
 }
 
 /* =========================
@@ -1012,3 +954,4 @@ if (require.main === module) {
   app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 }
 module.exports = app;
+
